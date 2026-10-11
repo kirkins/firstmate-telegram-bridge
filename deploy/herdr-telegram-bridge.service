@@ -1,0 +1,45 @@
+# herdr telegram bridge — persistent systemd --user service
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/herdr-telegram-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+# Enable autostart at login (one-time, explicit):
+#   systemctl --user enable herdr-telegram-bridge
+# Start / stop by hand when wanted:
+#   systemctl --user start herdr-telegram-bridge
+#   systemctl --user stop herdr-telegram-bridge
+# Logs: journalctl --user -u herdr-telegram-bridge
+#       plus the bridge's own ~/.local/state/herdr-telegram-bridge/bridge.log
+#
+# The bot token is resolved from the Secret Service at startup (see
+# bot_token_secret in config.example.toml), so the user keyring must be
+# unlocked. Early in a login session the keyring may not be unlocked yet
+# (and the network may not be up), so the unit keeps retrying every
+# RestartSec instead of giving up — StartLimitIntervalSec=0 removes the
+# start-rate limit and the retry loop bridges that keyring-unlock gap.
+
+[Unit]
+Description=herdr telegram bridge (reply poller + completion watcher)
+# a phone channel, not a boot blocker, but persistent across reboots: retry
+# until the session settles rather than failing out at early boot
+After=network-online.target
+# keep retrying through early-boot failures (locked keyring, late network)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# %h = the user's home; adjust the checkout path if you deploy elsewhere
+WorkingDirectory=%h/.local/share/herdr-telegram-bridge
+ExecStart=/usr/bin/python3 %h/.local/share/herdr-telegram-bridge/bot.py --daemon
+Environment=HERDR_PLUGIN_CONFIG_DIR=%h/.config/herdr-telegram-bridge
+Environment=HERDR_PLUGIN_STATE_DIR=%h/.local/state/herdr-telegram-bridge
+# a crash or early-boot failure is retried every 15s for as long as the unit
+# is on (enabled units keep retrying across login too)
+Restart=on-failure
+RestartSec=15
+
+# persistent posture: enable once and the bridge comes back after every
+# reboot; without `systemctl --user enable` it stays manual-only
+[Install]
+WantedBy=default.target

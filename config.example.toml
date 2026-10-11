@@ -1,0 +1,317 @@
+# Copy to the plugin config dir (herdr plugin config-dir telegram.bridge) as config.toml.
+
+# From @BotFather
+bot_token = "REPLACE_ME:token"
+# Instead of the token in this file, name a Secret Service entry and leave
+# bot_token unset: it is fetched via `secret-tool lookup` at startup (attributes
+# on the command line, the secret itself never on one, never in a log).
+# Store it once:
+#   printf %s 'TOKEN' | secret-tool store --label='herdr-telegram-bridge token' \
+#       service herdr-telegram-bridge account bot_token
+# A literal bot_token above always wins; an unresolvable secret degrades exactly
+# like an unset token (loud in bridge.log, sends refused).
+# bot_token_secret = { service = "herdr-telegram-bridge", account = "bot_token" }
+# Your numeric chat id (message @userinfobot, or getUpdates)
+chat_id = "REPLACE_ME"
+
+# Agent statuses that trigger a push: done, blocked, idle, working, unknown.
+# "done" = finished; "blocked" = waiting for your input.
+statuses = ["done", "blocked"]
+
+# Only notify for these agents (herdr agent ids, e.g. "claude", "codex").
+# Empty or omitted = all agents.
+# agents = ["claude"]
+
+# herdr infers agent state by reading the terminal, and some CLIs blink through a state
+# mid-turn — grok flashes "blocked" for about a second as it starts, which would push a
+# notification before you had even asked it anything. Before sending, wait this long and
+# re-read the pane; if it has moved on, the transition was a flap and is dropped. This is
+# added latency on every notification. 0 disables it.
+settle_ms = 4000
+
+# Skip repeat pushes for the same pane+status within this many seconds.
+quiet_seconds = 5
+
+# Max characters of the agent's final reply to include. 0 = the whole thing, split
+# across as many messages as it takes (Telegram caps one message at 4096 characters
+# and rejects anything longer — it does not split for you).
+snippet_chars = 0
+
+# Render the reply as markdown. Telegram only accepts b/i/u/s/code/pre/a/blockquote,
+# so headings become bold, lists become bullets, and tables become monospaced blocks.
+# A reply longer than a couple of lines goes in an expandable quote — tap to unfold —
+# so a chatty agent doesn't flood the chat. false sends flat, unformatted text.
+markdown = true
+
+# Characters of the pane title kept in the header line. The header is one line —
+# status icon, agent, folder, title — so a phone's notification preview spends its
+# few visible lines on the reply instead of on metadata.
+title_chars = 48
+
+# Hard cap on how many messages a single notification may span.
+max_messages = 8
+
+# How a long reply is presented.
+#   "auto"  — fold it into an expandable quote. Telegram won't nest a code block inside
+#             a quote (it cuts the quote short and starts a new one), so inside a fold
+#             code and tables use inline monospace: one tidy block, no highlighting.
+#   "never" — no folding. Code blocks keep syntax highlighting and a copy button, and a
+#             long reply is simply long.
+# Unset, this defaults to "auto" — except under [firstmate] enabled = true, where it
+# defaults to "never": a blockquote renders like a reply quote, and in the single-agent
+# chat every push should read as a fresh standalone message. Setting the key explicitly
+# always wins, in either mode.
+# fold = "auto"
+
+# How many sent messages stay routable. The map is rewritten whole on every send, so it
+# is capped; replying to something older than this reports an error rather than guessing
+# an agent. Raise it if you reply to old notifications.
+msg_map_limit = 1000
+
+# --- replies -----------------------------------------------------------------
+
+# Read Telegram replies and feed them back into the agent they came from.
+# Set to false to keep notifications one-way (then no poller process runs).
+replies = true
+
+# Where a message that isn't a reply goes: true = the most recently active agent,
+# false = nowhere, so you always have to reply to a notification or use /agents.
+reply_to_latest = true
+
+# Extra allowlist on top of chat_id: only these Telegram user ids may drive agents.
+# Empty or omitted = anyone in the configured chat (i.e. just you, in a private chat).
+# allowed_user_ids = [123456789]
+
+# Default number of terminal lines /read returns.
+read_lines = 40
+
+# `herdr agent prompt` writes the text and the Enter in one burst. A busy agent queues
+# that fine, but an idle Claude Code folds the Enter into its paste detection and leaves
+# the text sitting in the input box. So if the agent hasn't started working after
+# submit_wait_ms, press Enter once more. Turn off if your agent double-submits.
+submit_fallback = true
+submit_wait_ms = 2500
+
+# --- attachments -------------------------------------------------------------
+
+# Accept photos and files sent to the bot. herdr's injection channel is text only, so
+# the file is saved to <state dir>/inbox/ and the agent is handed its absolute path,
+# preceded by the caption when there is one. false replies that they're turned off.
+accept_files = true
+
+# Delete inbox files older than this many days. The poller sweeps every 6 hours and on
+# startup. 0 keeps everything forever.
+inbox_days = 7
+
+# Refuse anything larger. Telegram bots cannot fetch files above 20 MB at all, so this
+# only ever lowers the ceiling.
+max_file_mb = 20
+
+# --- network -----------------------------------------------------------------
+
+# Optional: proxy for reaching api.telegram.org, e.g. "http://127.0.0.1:7890"
+# proxy = ""
+
+# Optional: alternative API endpoint (reverse proxy of api.telegram.org)
+# api_base = "https://api.telegram.org"
+
+# --- watcher -----------------------------------------------------------------
+
+# herdr's pane.agent_status_changed events are the fast path — but they are not
+# always delivered: on herdr 0.9.1 here, panes transition working/idle all day
+# while the event hook sees essentially nothing, so the phone stays silent no
+# matter what statuses says. The reply poller therefore also watches the
+# old-fashioned way: every poll_seconds it runs `herdr agent list` (cheap JSON)
+# and diffs each pane's status, pushing through the exact same path as the
+# events. The diff is focus-independent — working -> idle counts as done for
+# EVERY pane, because herdr only reports "done" for panes you aren't looking
+# at, and the point is knowing what finished while you were away with just the
+# phone. The first pass after a start only records the baseline, so a restart
+# doesn't re-announce everything already finished. The event hook stays wired
+# alongside; quiet_seconds keeps the two from double-sending a transition they
+# both catch. This rides the reply poller, so replies = false turns it off too.
+# 0 disables the watcher (events only again). Minimum 5.
+[watch]
+poll_seconds = 20
+
+# Content-anchored delivery (default true). Sampling statuses can miss a
+# completion twice over: a turn that starts and ends between two polls never
+# changes the sampled status (idle -> idle), and herdr's status events are
+# unreliable besides. So each poll also resolves every pane's transcript (the
+# same per-CLI resolution the notification snippet uses) and tracks the
+# identity of its LAST assistant message — message id, or a hash of the text,
+# plus its timestamp. A NEW final message that has never been pushed, on a pane
+# observed idle or done, pushes through the same path as everything else;
+# while the pane reads working the message is held until it goes quiet.
+# Firstmate Codex can instead prove public message completion from paired native
+# records and deliver those complete updates during work, and the firstmate
+# main pane's other CLIs run the mid-run relay instead — every sealed text
+# block after the delivery boundary, not just the last message (README
+# Firstmate posture).
+# Every path (events, status diff, this one) dedupes on that message identity via a
+# shared sent-marker, so a finished message reaches the phone exactly once.
+# Panes whose transcript cannot be resolved simply stay on the status diff.
+# false restores the pure status diff.
+content_delivery = true
+
+# --- firstmate posture -------------------------------------------------------
+#
+# Fleet mode routes through the Firstmate main pane by default. Set enabled = false
+# for generic per-pane Herdr behavior. With fleet mode on,
+# exactly one pane — the firstmate main pane — is prompt-replyable; every other
+# pane (workers, scouts) surfaces as read-only context, and outbound relay is an
+# allowlist of one too: notifications push from the main pane only, so worker and
+# sub-agent sessions never reach the phone (no config key can re-enable that).
+# See README.md "Firstmate posture" for details.
+#
+# NOTE: allowed_user_ids stays a TOP-LEVEL key (see the replies section above) —
+# it is not read from inside [firstmate]. Under firstmate mode it is mandatory:
+# with it empty the bridge refuses the control channel entirely and degrades to
+# notify-only (notifications still arrive; replies and /esc get a clear error).
+
+[firstmate]
+enabled = true
+
+# Set to false to restore generic per-pane Herdr behavior.
+
+# The main pane is identified by an exact match of its herdr-reported cwd against
+# this path. Everything firstmate spawns runs in a throwaway worktree, so the home
+# directory is the one stable discriminator; pane ids churn across restarts and
+# terminal titles are CLI-controlled. If several panes ever match (a worker that
+# cd'd into the home), the one no state/*.meta claims wins; if it is still
+# ambiguous, replies fail closed with an error instead of guessing.
+main_cwd = "~/firstmate"
+
+# Optional hard pin: verify this exact pane id at runtime instead of scanning by
+# cwd. Revalidated live on every use — a stale pin falls back to the cwd scan.
+# main_pane = "w3:p1"
+
+# If Herdr omits the main Codex pane's agent_session, run codex_binding.py from
+# that conversation's native tool shell with the bridge's config/state dirs.
+# A managed app-server shell also needs --primary-session UUID supplied by the
+# primary owner from the current conversation's verified native reference.
+# Its exact pane/process/session binding lives in <state dir>/codex_main.json;
+# no session id belongs in this config. Rebind after session replacement. A
+# changed same-cwd rollout invalidates the binding instead of selecting it.
+# See deploy/README.md "Codex main-session binding". Generic mode ignores it.
+
+# Optional override for where task state (*.meta / *.status) is read from; the
+# default is <main_cwd>/state. Rarely needed.
+# state_dir = ""
+
+# Outbound relay is main-pane only — structural, no key to change it. Your
+# phone carries the primary firstmate session's messages; worker, scout and foreign
+# panes never notify (each refusal is one bridge.log line, and they cost nothing,
+# not even settle/debounce work). An older config's `worker_notify` key is ignored;
+# startup logs a warning naming it if it is still set.
+
+# false (default) = /esc only ever interrupts the main pane — interrupting a worker
+# is firstmate's job, from its own pane. true re-enables /esc on the worker a
+# target names (sticky /agents context, or an older map entry) as an escape hatch.
+allow_worker_esc = false
+
+# Notification framing under firstmate mode (see README "Firstmate posture"):
+# every push reads as a fresh standalone message. The header never falls back to
+# the session's opening prompt when the terminal title is just a CLI banner — the
+# opener is the session's FIRST message and stays frozen there, so quoting it on
+# every push reads as a reply to it — and long replies are not folded into an
+# expandable blockquote (which Telegram renders like a reply quote); they go out
+# as plain rendered text. Folding can be restored for this deployment by setting
+# the top-level fold = "auto". With enabled = false both behaviors are exactly
+# upstream's.
+
+# false (default) = the MAIN pane's push carries no header line at all — just the
+# final reply. "✅ pi · /cwd" names the one pane you can already reply to by
+# default, so it is pure prefix noise in the single-agent chat. Under firstmate
+# mode the main pane is also the only pane that pushes at all. true restores the
+# header line on main-pane pushes. No effect with enabled = false.
+# main_header = true
+
+# --- voice messages ----------------------------------------------------------
+#
+# With this section present and enabled, a voice note is transcribed with the Groq
+# Whisper API and the transcript is submitted exactly like a typed reply — same
+# routing, same reply threading; the audio file itself is still saved to the inbox
+# either way. With the section absent, or enabled = false, a voice note is just an
+# attachment: saved, and the agent handed its path.
+[stt]
+enabled = true
+# Only "groq" is supported for now; anything else is refused loudly (in the log
+# at startup, and to the chat when a voice note arrives) rather than guessed at.
+provider = "groq"
+# From console.groq.com (API Keys → Create API Key). Lives only in this file —
+# keep it mode 600 next to bot_token. It is never committed, never logged, never
+# printed: it rides to curl in a 0600 header file, not argv, and error strings are
+# redacted of it before they reach the log or the chat.
+api_key = "REPLACE_ME:gsk"
+# Optional model override; whisper-large-v3-turbo is the default and the tested one.
+# model = "whisper-large-v3-turbo"
+# ISO language hint, e.g. "en". Empty (default) lets the model auto-detect, which
+# misreads short clips more often.
+# language = ""
+# One transcription call's curl timeout in seconds. Voice notes are tiny Opus
+# files, but a long note on a slow link can take a while to upload.
+# timeout_secs = 90
+# Echo the transcript back to the chat (🎙️ "…") so you can check STT quality in
+# real time; false confirms with a plain 🎙️ voice → agent line instead.
+# echo_transcript = true
+
+# --- spoken replies (voice output) ---------------------------------------------
+#
+# /voice toggles the mode from the chat. With it on, every agent reply that
+# pushes a notification is ALSO spoken through a TTS API and sent as a
+# Telegram voice note, right after the text message — the text always goes out
+# first, so a slow or failing speech call never loses the reply. Without this
+# section (or with enabled = false) /voice reports the mode unavailable and
+# replies are text-only.
+[tts]
+enabled = true
+# "openai" (default) speaks the standard OpenAI speech API shape: one JSON
+# POST to {base_url}/audio/speech (model, input, voice, response_format) with
+# raw audio back — any compatible gateway works.
+# "cloudflare" speaks Workers AI's native shape instead, because Workers AI
+# has no OpenAI-compatible speech route (verified 2026-10-09:
+# .../ai/v1/audio/speech answers 400 "No route for that URI"): a POST to
+# /client/v4/accounts/{account_id}/ai/run/{model} whose input field differs
+# per model family — "text" for the Deepgram Aura models, "prompt" for
+# @cf/myshell-ai/melotts — so the adapter sends both.
+provider = "cloudflare"
+# Cloudflare account id (cloudflare provider only). Find this in your
+# Cloudflare dashboard under account details. It is an identifier, not a
+# credential; keep the config file mode 600 anyway.
+account_id = "REPLACE_ME"
+# The API key/token. Either a literal here (keep the file mode 600), or a
+# Secret Service entry named below so it never sits in a file. The key is
+# never logged and rides to curl in a 0600 header file rather than argv.
+api_key = "REPLACE_ME"
+# api_key_secret = { service = "herdr-telegram-bridge", account = "tts_api_key" }
+# Which voice to use. OpenAI-shaped providers need one (default "alloy");
+# Cloudflare's models accept the field but are verified to ignore it, so it is
+# sent there only when set explicitly.
+# voice = "alloy"
+# Per-provider model. cloudflare defaults to @cf/myshell-ai/melotts — the
+# cheap, fast one (~$0.0002 per audio minute, 1–4s for a typical reply; returns
+# base64 WAV, converted to Ogg/Opus with ffmpeg). The better-sounding Deepgram
+# Aura models bill per character (~$0.03/1k chars for aura-2-en, ~$0.015 for
+# aura-1) and take longer on long input:
+#   model = "@cf/deepgram/aura-2-en"
+# openai defaults to "gpt-4o-mini-tts"; response_format defaults to "opus",
+# which is Ogg/Opus already — the one case that needs no ffmpeg.
+# model = "gpt-4o-mini-tts"
+# response_format = "opus"
+# base_url = "https://api.openai.com/v1"
+# No spoken-text cap by default: every reply is spoken in full, however long.
+# Prose longer than the provider's per-request input budget is chunked on
+# sentence boundaries, each chunk synthesized separately, and the parts are
+# assembled by ffmpeg into ONE voice note (openai budget 4096 chars per its
+# published spec; cloudflare 1000 — no limit is published). Set a positive
+# value only if you ever want the spoken text cut again (sentence boundary):
+# max_chars = 0
+# Override the per-request chunk size (characters) for exotic gateways:
+# chunk_chars = 4096
+# By default, every delivered message is spoken, including Firstmate mid-run
+# relays. Set true to speak only final replies; intermediate messages remain
+# text-only. With generic Herdr mode there are no mid-run relays.
+speak_final_only = false
+# One speech call's budget in seconds.
+# timeout_secs = 45

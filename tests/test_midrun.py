@@ -44,6 +44,8 @@ TURNSTILE_TEXT = "Operator, the turnstile is done and fully landed."
 BUGREPORT_TEXT = ("Operator, you were right the first time — filed with the "
                   "proof attached.")
 FINAL_TEXT = "Operator, that's the sweep complete for tonight."
+NOOP_ACK = "Captain, shipshape."                  # the routine handled-wake all-clear
+NOOP_ACK_ID = "ack@1791595800000"
 
 
 class MidrunCase(unittest.TestCase):
@@ -658,6 +660,57 @@ class TestEnumeration(MidrunCase):
             self.run_once(entry, {MAIN: "idle"}, cfg)
         self.assertEqual(self.sent_count(), 1)
         self.assertTrue(any("grok's second" in t for t in self.sent_texts()))
+
+
+class TestNoopSuppression(MidrunCase):
+    """suppress_noop_ack through the watcher: the routine no-op
+    acknowledgement must not reach the phone — no text, no voice — and must
+    not wedge the relay either: the stamped sent-marker settles the delivery
+    boundary after one pass instead of retrying the suppressed message on
+    every poll, and later substantive messages still deliver."""
+
+    def cfg(self):
+        cfg = self.config()
+        cfg["suppress_noop_ack"] = True
+        return cfg
+
+    def suppressed_lines(self):
+        return [ln for ln in self.log_since()
+                if "no-op acknowledgement suppressed" in ln]
+
+    def test_ack_suppressed_once_then_settled_and_later_news_delivers(self):
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline"], ids=["m0"], cfg=self.cfg())
+        self.assertEqual(self.sent_count(), 0)                  # baseline primed
+        # the ack lands as the pane's only new message: suppressed, not sent
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline", NOOP_ACK], ids=["m0", NOOP_ACK_ID],
+                  cfg=self.cfg())
+        self.assertEqual(self.sent_count(), 0)                  # nothing sent
+        self.assertEqual(self.spoken, [])                       # nothing spoken
+        self.assertIn(notify.content_key(MAIN, NOOP_ACK_ID), self.marker())
+        self.assertEqual(len(self.suppressed_lines()), 1)       # logged once
+        # the next poll must not retry it: no second suppression line, no send
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline", NOOP_ACK], ids=["m0", NOOP_ACK_ID],
+                  cfg=self.cfg())
+        self.assertEqual(self.sent_count(), 0)
+        self.assertEqual(len(self.suppressed_lines()), 1)
+        # and a later substantive message still delivers — the boundary moved
+        # past the suppressed ack, so the relay is not wedged
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline", NOOP_ACK, TURNSTILE_TEXT],
+                  ids=["m0", NOOP_ACK_ID, TURNSTILE_ID], cfg=self.cfg())
+        self.assertEqual(self.sent_count(), 1)
+        self.assertIn(TURNSTILE_TEXT, self.sent_texts()[0])
+
+    def test_ack_still_relays_when_the_key_is_off(self):
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline"], ids=["m0"])            # default config
+        self.poll(status="idle", prev={MAIN: "idle"},
+                  replies=["baseline", NOOP_ACK], ids=["m0", NOOP_ACK_ID])
+        self.assertEqual(self.sent_count(), 1)
+        self.assertIn(NOOP_ACK, self.sent_texts()[0])
 
 
 if __name__ == "__main__":

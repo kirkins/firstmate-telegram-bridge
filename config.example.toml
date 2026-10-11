@@ -32,6 +32,17 @@ settle_ms = 4000
 # Skip repeat pushes for the same pane+status within this many seconds.
 quiet_seconds = 5
 
+# Drop the routine no-op acknowledgement ("Captain, shipshape.") from Telegram
+# entirely: no text, no voice, no notification — a handled-wake confirmation
+# carries no news, so with this on the phone notifies only when something
+# actually happened (outcomes, decisions, failures). The whole message must
+# equal the acknowledgement string, matched like the voice skip (whitespace-
+# collapsed, case-insensitive, final full stop optional); anything else — extra
+# text around it, any other message — delivers unchanged. Every drop is one
+# bridge.log line. false (the default) keeps today's behavior: the ack still
+# arrives as a quiet text bubble (never spoken).
+suppress_noop_ack = false
+
 # Max characters of the agent's final reply to include. 0 = the whole thing, split
 # across as many messages as it takes (Telegram caps one message at 4096 characters
 # and rejects anything longer — it does not split for you).

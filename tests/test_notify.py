@@ -22,6 +22,7 @@ TASK = ("bridge-fork-build", WORKER, "ship", ["done [at=1790000100]: PR opened"]
 NARRATION = "Let me check that file."                       # short, single-line
 SUBSTANTIVE = "The race was in the fixture teardown.\nAll three tests pass now."
 FINAL_REPLY = "done: all green, PR opened"                  # short but final
+NOOP_ACK = "Captain, shipshape."                            # the handled-wake all-clear
 
 
 def event(pane, status="done", cli="pi"):
@@ -46,8 +47,10 @@ class NotifyCase(unittest.TestCase):
                 agent(WORKER, f"{home}-treehouse/w1", cli="opencode", status="done",
                       title="OC | build the fork", session=worker_session)]
 
-    def run_notify(self, home, ev, agents_override=None, firstmate=True, **fm):
-        """One notify.py main() run with herdr stubbed to the fixture fleet."""
+    def run_notify(self, home, ev, agents_override=None, firstmate=True, top=None,
+                   **fm):
+        """One notify.py main() run with herdr stubbed to the fixture fleet.
+        `top` merges extra top-level config keys (suppressions, toggles)."""
         herdr = FakeHerdr(agents_override if agents_override is not None
                           else self.agents(home))
         tg.herdr_run = herdr.run
@@ -58,7 +61,7 @@ class NotifyCase(unittest.TestCase):
                   else {"enabled": False})
         write_config({"chat_id": str(CHAT), "bot_token": "T0K:EN", "replies": False,
                       "settle_ms": 0, "quiet_seconds": 0,
-                      "statuses": ["done", "blocked"],
+                      "statuses": ["done", "blocked"], **(top or {}),
                       "firstmate": fm_cfg})
         os.environ["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(ev)
         self.addCleanup(os.environ.pop, "HERDR_PLUGIN_EVENT_JSON", None)
@@ -258,6 +261,64 @@ class TestCalmExcerpt(NotifyCase):
         self.run_notify(home, event(foreign, "blocked"), agents_override=fleet,
                         firstmate=False)
         self.assertTrue(any(NARRATION in t for t in self.api.texts))
+
+
+class TestSuppressNoopAck(NotifyCase):
+    """suppress_noop_ack: the routine no-op acknowledgement is a handled-wake
+    confirmation, not news. With the key on, a message that is nothing but
+    'Captain, shipshape.' never reaches Telegram at all — no text, no voice,
+    no notification — and the sent-marker records it as handled so the
+    watcher's content passes treat it as delivered news instead of retrying
+    it on every poll. With the key off (the default) the ack still arrives as
+    its quiet text bubble, and with it on every other message — extra text
+    around the string, a substantive reply — still delivers unchanged."""
+
+    def ack_home(self, reply):
+        home = make_home(self.base, tasks=[TASK])
+        self.sessions[MAIN] = transcript(os.path.join(self.base, "m.jsonl"),
+                                         "please check the fleet", [reply],
+                                         ids=["m1"])
+        return home
+
+    def log_text(self):
+        with open(tg.LOG_PATH, encoding="utf-8") as f:
+            return f.read()
+
+    def test_off_by_default_the_ack_still_delivers_as_text(self):
+        home = self.ack_home(NOOP_ACK)
+        self.run_notify(home, event(MAIN))
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn(NOOP_ACK, self.api.texts[0])
+
+    def test_on_the_ack_never_reaches_telegram(self):
+        home = self.ack_home(NOOP_ACK)
+        self.run_notify(home, event(MAIN), top={"suppress_noop_ack": True})
+        self.assertEqual(self.api.sent, [])        # no text, no notification
+        self.assertEqual(self.map_entries(), {})   # nothing routable either
+        self.assertIn(f"skip pane={MAIN}: no-op acknowledgement suppressed",
+                      self.log_text())             # the drop is logged
+        # the marker is stamped: the watcher's content passes see the ack as
+        # handled instead of retrying it every poll
+        self.assertTrue(notify.content_already_sent(MAIN, "m1"))
+
+    def test_on_surrounding_whitespace_still_matches(self):
+        # the voice-skip match semantics: whitespace-collapsed whole-message
+        home = self.ack_home("\n  Captain, shipshape.  \n")
+        self.run_notify(home, event(MAIN), top={"suppress_noop_ack": True})
+        self.assertEqual(self.api.sent, [])
+        self.assertTrue(notify.content_already_sent(MAIN, "m1"))
+
+    def test_on_extra_text_still_delivers(self):
+        home = self.ack_home("Captain, shipshape. Two tests fail; fixing now.")
+        self.run_notify(home, event(MAIN), top={"suppress_noop_ack": True})
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn("Two tests fail", self.api.texts[0])
+
+    def test_on_substantive_reply_delivers_unchanged(self):
+        home = self.ack_home(SUBSTANTIVE)
+        self.run_notify(home, event(MAIN), top={"suppress_noop_ack": True})
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertIn(SUBSTANTIVE.split("\n")[0], self.api.texts[0])
 
 
 if __name__ == "__main__":

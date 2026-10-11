@@ -86,12 +86,33 @@ ACK_SHAPES = (
     "captain, all clear",
 )
 
+# The routine no-op acknowledgement itself — the handled-wake all-clear a
+# supervisor answers with. notify.deliver's suppress_noop_ack drops exactly
+# this string from Telegram (the text push too, not just the voice note);
+# aliased to ACK_SHAPES[0] so this matcher and the voice skip cannot drift.
+NOOP_ACK = ACK_SHAPES[0]
+
+
+def _ack_normal(text: str) -> str:
+    """The match form the acknowledgement rules share: whitespace-collapsed,
+    case-folded, final full stop tolerated."""
+    return " ".join((text or "").split()).strip().rstrip(".").strip().lower()
+
 
 def is_pure_acknowledgement(text: str) -> bool:
     """True when the whole message is a trivial all-clear — exactly one of the
     ACK_SHAPES, with or without its final full stop. Nothing else matches."""
-    spoken = " ".join((text or "").split()).strip().rstrip(".").strip().lower()
-    return spoken in ACK_SHAPES
+    return _ack_normal(text) in ACK_SHAPES
+
+
+def is_noop_acknowledgement(text: str) -> bool:
+    """True when the whole message is the routine no-op acknowledgement —
+    'Captain, shipshape.' itself — under the same match semantics as
+    is_pure_acknowledgement: whitespace-collapsed, case-insensitive, with or
+    without its final full stop, whole-message only. The other ACK_SHAPES are
+    all-clears the voice skip spares too, but only this string is the no-op
+    acknowledgement suppress_noop_ack drops from delivery."""
+    return _ack_normal(text) == NOOP_ACK
 
 
 VOICE_MODE = "voice_mode.json"

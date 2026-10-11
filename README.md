@@ -107,6 +107,8 @@ Configure `[tts]` — like voice input, this runs on any OpenAI-compatible endpo
 
 **Pure acknowledgements stay text-only.** A message that is nothing but a trivial all-clear — “Captain, shipshape.” and its few trivially-equivalent forms (`tts.ACK_SHAPES`), matched whole-message only — is never spoken: a voice bubble for a nothing-happened signal is noise, so the skip is logged like the other refusals and the text bubble carries it. An acknowledgement embedded in a longer substantive message still speaks.
 
+**The no-op acknowledgement can be dropped entirely.** `suppress_noop_ack = true` stops even that text push when the message is nothing but the routine no-op acknowledgement (“Captain, shipshape.”, matched with the same semantics the voice skip uses): nothing reaches Telegram — no text, no voice, no notification — so the phone notifies only when something actually happened. Each drop is one `bridge.log` line; every other message delivers unchanged. `false` (the default) keeps the quiet text bubble.
+
 **An absent `[tts]` section or a bad key makes `/voice` report exactly why** instead of breaking replies; runtime failures log to bridge.log and warn the chat at most once an hour.
 
 A consolidated single voice note for several messages is under consideration.
@@ -163,6 +165,7 @@ Everything else has a working default. [`config.example.toml`](config.example.to
 
 - which `statuses` notify, an `agents` filter
 - `settle_ms`, `quiet_seconds`, `snippet_chars`
+- `suppress_noop_ack` to drop the routine “Captain, shipshape.” no-op acknowledgement from Telegram entirely (no text, no voice, no notification)
 - `markdown` / `fold` / `max_messages`
 - `replies` / `reply_to_latest` / `allowed_user_ids` / `read_lines`
 - `accept_files` / `inbox_days` / `max_file_mb`

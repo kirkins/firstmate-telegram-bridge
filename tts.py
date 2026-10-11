@@ -74,6 +74,26 @@ DEFAULT_TIMEOUT = 45          # one speech call's budget (aura-2 can take ~25s)
 PROVIDER_CHUNK_CHARS = {"openai": 4096, "cloudflare": 1000}
 DEFAULT_CHUNK_CHARS = 4096
 
+# Pure acknowledgements — a "nothing happened" signal that still gets a
+# reply — are noise as voice bubbles; the quiet text bubble is the delivery.
+# Whole-message match on the speakable prose only (whitespace-collapsed),
+# never a substring: an acknowledgement embedded in a substantive reply still
+# speaks. Kept as a small explicit list so the rule is visible and testable.
+ACK_SHAPES = (
+    "captain, shipshape",
+    "shipshape, captain",
+    "all clear, captain",
+    "captain, all clear",
+)
+
+
+def is_pure_acknowledgement(text: str) -> bool:
+    """True when the whole message is a trivial all-clear — exactly one of the
+    ACK_SHAPES, with or without its final full stop. Nothing else matches."""
+    spoken = " ".join((text or "").split()).strip().rstrip(".").strip().lower()
+    return spoken in ACK_SHAPES
+
+
 VOICE_MODE = "voice_mode.json"
 WARN_STATE = "tts_warn.json"
 WARN_EVERY = 3600             # chat warnings about speech failures: at most 1/h
@@ -614,6 +634,9 @@ def _speak(cfg: dict, text: str, target: dict | None,
     spoken = speech_text(text, cap)   # uncapped by default: the full reply
     if not spoken:
         tg.log("tts: nothing speakable in the reply (code/table only) — no voice note")
+        return
+    if is_pure_acknowledgement(spoken):
+        tg.log("tts: pure acknowledgement stays text-only — no voice note")
         return
     limit = chunk_chars(cfg)
     chunks = speech_chunks(spoken, limit)

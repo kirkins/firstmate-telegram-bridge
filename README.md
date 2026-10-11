@@ -105,6 +105,8 @@ Configure `[tts]` — like voice input, this runs on any OpenAI-compatible endpo
 
 **Speech includes every Firstmate mid-run message by default.** Set `[tts] speak_final_only = true` to keep intermediate messages text-only and speak only final replies; `false` (the shipped default) speaks both.
 
+**Pure acknowledgements stay text-only.** A message that is nothing but a trivial all-clear — “Captain, shipshape.” and its few trivially-equivalent forms (`tts.ACK_SHAPES`), matched whole-message only — is never spoken: a voice bubble for a nothing-happened signal is noise, so the skip is logged like the other refusals and the text bubble carries it. An acknowledgement embedded in a longer substantive message still speaks.
+
 **An absent `[tts]` section or a bad key makes `/voice` report exactly why** instead of breaking replies; runtime failures log to bridge.log and warn the chat at most once an hour.
 
 A consolidated single voice note for several messages is under consideration.

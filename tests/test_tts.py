@@ -640,6 +640,25 @@ class TestMaybeSpeak(TtsCase):
         self.assertEqual(len(self.api.sent), 1)
         self.assertEqual(self.voice.calls, [])
 
+    def test_pure_acknowledgement_skips_voice(self):
+        tts.set_voice_mode(True)
+        self.deliver(reply="Captain, shipshape.")
+        self.assertEqual(len(self.api.sent), 1)         # the text push goes out
+        self.assertEqual(self.voice.calls, [])          # but no voice note
+        self.assertEqual(self.runner.argvs, [])         # nothing synthesized
+
+    def test_substantive_reply_still_speaks(self):
+        tts.set_voice_mode(True)
+        self.deliver(reply="Captain, shipshape. Two tests fail; fixing now.")
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertEqual(len(self.voice.calls), 1)
+
+    def test_acknowledgement_inside_a_longer_message_still_speaks(self):
+        tts.set_voice_mode(True)
+        self.deliver(reply="All clear, Captain — three files changed, CI green.")
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertEqual(len(self.voice.calls), 1)
+
     def test_sendvoice_failure_warns_after_the_text(self):
         tts.set_voice_mode(True)
         self.voice = FakeVoice(err="telegram: BOT_WRITE_NOT_ALLOWED")

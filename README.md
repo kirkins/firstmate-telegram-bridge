@@ -48,11 +48,19 @@ No relay server, no tunnel, no port to open, no companion app. Fleet mode is ena
 
 ## What it does
 
-**Notifications** — one line of context (status, agent, directory, pane title) and then the agent's final reply. The header is deliberately short: a phone's notification preview gets only a few lines and they should go to the reply. herdr reports `done` only for unfocused panes, so the plugin also tracks `working → idle` per pane and treats that as a completion — you get told either way, focused or not. `statuses`, an `agents` allowlist and a `quiet_seconds` debounce control what is worth interrupting you for.
+### Notifications
 
-**Replies** — your text is submitted with `herdr agent prompt`; the agent starts working, finishes, and the next notification arrives on its own. A message that isn't a reply goes to the most recently active agent, so a back-and-forth doesn't need long-pressing every time.
+One line of context (status, agent, directory, pane title) and then the agent's final reply. The header is deliberately short: a phone's notification preview gets only a few lines and they should go to the reply.
 
-**Commands** — published with `setMyCommands`, so they show up in Telegram's menu button:
+herdr reports `done` only for unfocused panes, so the plugin also tracks `working → idle` per pane and treats that as a completion — you get told either way, focused or not. `statuses`, an `agents` allowlist and a `quiet_seconds` debounce control what is worth interrupting you for.
+
+### Replies
+
+Your text is submitted with `herdr agent prompt`; the agent starts working, finishes, and the next notification arrives on its own. A message that isn't a reply goes to the most recently active agent, so a back-and-forth doesn't need long-pressing every time.
+
+### Commands
+
+Published with `setMyCommands`, so they show up in Telegram's menu button:
 
 | | |
 |---|---|
@@ -62,13 +70,48 @@ No relay server, no tunnel, no port to open, no companion app. Fleet mode is ena
 | `/voice [on\|off\|status]` | toggle spoken replies: with the mode on, agent replies are additionally spoken through a configurable TTS API and sent as voice notes (needs a `[tts]` section) |
 | `/help` | how replying works |
 
-**Attachments** — photos, documents, voice notes and video are saved to `<state dir>/inbox/`, and the agent is prompted with your caption plus the absolute path. Sender-supplied filenames are flattened to a plain basename, and the inbox is swept of anything older than `inbox_days` (7) every six hours.
+### Attachments
 
-**Voice** — configure `[stt]` and a voice note becomes a spoken reply: it is transcribed through an OpenAI-compatible audio-transcriptions API and the transcript is submitted exactly like typed text — same routing, same reply threading, caption prepended when there is one. The audio is still saved to the inbox either way. An empty or inaudible note becomes an explicit "came through empty" marker rather than a blank prompt, and a failed transcription is reported to you with a plain-language reason instead of dropped; without `[stt]`, a voice note is just an attachment. Music sent as an audio *file* is never transcribed — only voice bubbles are. Configure `[stt]`: transcription speaks the standard OpenAI shape — one multipart `POST {base_url}/audio/transcriptions` with the key as a bearer header — so any OpenAI-compatible transcription gateway works. `provider = "groq"` (the default, and the tested convenience) points at Groq's Whisper endpoint (`whisper-large-v3-turbo` by default); `provider = "openai"` speaks the plain OpenAI audio API (`whisper-1` by default). Either value honors a `[stt] base_url` override, so any other compatible endpoint works by pointing at it and setting `[stt] model` to what it serves.
+Photos, documents, voice notes and video are saved to `<state dir>/inbox/`, and the agent is prompted with your caption plus the absolute path. Sender-supplied filenames are flattened to a plain basename, and the inbox is swept of anything older than `inbox_days` (7) every six hours.
 
-**Voice output** — the other direction: `/voice` toggles spoken replies for the chat. With it on, each delivered message is spoken through a text-to-speech API and sent as an Ogg/Opus voice note right after the text message. The text always arrives first, so a slow or failing speech call never loses or delays the reply, and replying to the voice bubble routes exactly like replying to the text. Configure `[tts]` — like voice input, this runs on any OpenAI-compatible endpoint: the default `provider = "openai"` speaks the standard OpenAI speech API shape (`POST {base_url}/audio/speech`, raw audio back — any compatible gateway works, `base_url` points it anywhere, and `response_format = "opus"` is Ogg/Opus already). `provider = "cloudflare"` is the tested convenience for Cloudflare Workers AI, which has **no OpenAI-compatible speech route** (verified 2026-10-09: `.../ai/v1/audio/speech` answers 400 “No route for that URI” — the compat surface covers chat and embeddings only), so it speaks Workers AI's native shape instead: a POST to `/client/v4/accounts/{account_id}/ai/run/{model}` whose input field differs per model family — `text` for the Deepgram Aura models, `prompt` for `@cf/myshell-ai/melotts` — so the adapter sends both. Aura returns raw MP3, melotts a base64-WAV JSON envelope; anything not already Ogg/Opus is converted with ffmpeg, which voice-output mode therefore requires for those providers. Code blocks and tables become a spoken “code omitted” placeholder (the text message carries them in full), and every reply is spoken in full, however long. Speech includes every Firstmate mid-run message by default. Set `[tts] speak_final_only = true` to keep intermediate messages text-only and speak only final replies; `false` (the shipped default) speaks both. A consolidated single voice note for several messages is under consideration. Prose longer than the provider's per-request input budget is chunked on sentence boundaries — each chunk synthesized separately, then assembled by ffmpeg into ONE Ogg/Opus voice note (the budget is 4096 chars for the OpenAI shape per its published spec, 1000 for cloudflare where no limit is published; `[tts] chunk_chars` overrides it, and an explicit `[tts] max_chars` still truncates if ever wanted). A failed chunk fails the whole note rather than sending a half-spoken message. An absent `[tts]` section or a bad key makes `/voice` report exactly why instead of breaking replies; runtime failures log to bridge.log and warn the chat at most once an hour.
+### Voice input
 
-**Reply text** is read from each agent CLI's own session storage:
+Configure `[stt]` and a voice note becomes a spoken reply: it is transcribed through an OpenAI-compatible audio-transcriptions API and the transcript is submitted exactly like typed text — same routing, same reply threading, caption prepended when there is one. The audio is still saved to the inbox either way.
+
+- An empty or inaudible note becomes an explicit "came through empty" marker rather than a blank prompt.
+- A failed transcription is reported to you with a plain-language reason instead of dropped.
+- Without `[stt]`, a voice note is just an attachment.
+- Music sent as an audio *file* is never transcribed — only voice bubbles are.
+
+Configure `[stt]`: transcription speaks the standard OpenAI shape — one multipart `POST {base_url}/audio/transcriptions` with the key as a bearer header — so any OpenAI-compatible transcription gateway works:
+
+- **`provider = "groq"`** (the default, and the tested convenience) points at Groq's Whisper endpoint (`whisper-large-v3-turbo` by default).
+- **`provider = "openai"`** speaks the plain OpenAI audio API (`whisper-1` by default).
+
+Either value honors a `[stt] base_url` override, so any other compatible endpoint works by pointing at it and setting `[stt] model` to what it serves.
+
+### Voice output
+
+The other direction: `/voice` toggles spoken replies for the chat. With it on, each delivered message is spoken through a text-to-speech API and sent as an Ogg/Opus voice note right after the text message. The text always arrives first, so a slow or failing speech call never loses or delays the reply, and replying to the voice bubble routes exactly like replying to the text.
+
+Configure `[tts]` — like voice input, this runs on any OpenAI-compatible endpoint:
+
+- **`provider = "openai"` (the default)** speaks the standard OpenAI speech API shape — `POST {base_url}/audio/speech`, raw audio back — any compatible gateway works. `base_url` points it anywhere, and `response_format = "opus"` is Ogg/Opus already.
+- **`provider = "cloudflare"`** is the tested convenience for Cloudflare Workers AI, which has **no OpenAI-compatible speech route** (verified 2026-10-09: `.../ai/v1/audio/speech` answers 400 “No route for that URI” — the compat surface covers chat and embeddings only). It speaks Workers AI's native shape instead: a POST to `/client/v4/accounts/{account_id}/ai/run/{model}` whose input field differs per model family — `text` for the Deepgram Aura models, `prompt` for `@cf/myshell-ai/melotts` — so the adapter sends both. Aura returns raw MP3, melotts a base64-WAV JSON envelope; anything not already Ogg/Opus is converted with ffmpeg, which voice-output mode therefore requires for those providers.
+
+**Every reply is spoken in full, however long.** Code blocks and tables become a spoken “code omitted” placeholder — the text message carries them in full.
+
+**Prose longer than the provider's per-request input budget is chunked on sentence boundaries.** Each chunk synthesized separately, then assembled by ffmpeg into ONE Ogg/Opus voice note. The budget is 4096 chars for the OpenAI shape per its published spec, 1000 for cloudflare where no limit is published; `[tts] chunk_chars` overrides it, and an explicit `[tts] max_chars` still truncates if ever wanted. A failed chunk fails the whole note rather than sending a half-spoken message.
+
+**Speech includes every Firstmate mid-run message by default.** Set `[tts] speak_final_only = true` to keep intermediate messages text-only and speak only final replies; `false` (the shipped default) speaks both.
+
+**An absent `[tts]` section or a bad key makes `/voice` report exactly why** instead of breaking replies; runtime failures log to bridge.log and warn the chat at most once an hour.
+
+A consolidated single voice note for several messages is under consideration.
+
+### Reply text
+
+Reply text is read from each agent CLI's own session storage:
 
 | Agent | Source |
 |---|---|
@@ -82,7 +125,11 @@ No relay server, no tunnel, no port to open, no companion app. Fleet mode is ena
 
 Anything else still notifies and still takes replies — just without the transcript excerpt.
 
-Not every CLI sets a useful terminal title: pi shows `π - <user>`, hermes shows `π - <dir>`, codex shows the directory, a fresh Claude Code shows its own name. When herdr's title says nothing, the session's opening prompt is used instead — skipping the synthetic context (`AGENTS.md` dumps, `<user_info>` blocks) that agents front-load as user messages. A pane that has not been asked anything yet legitimately has no title either way. Firstmate mode skips this opening-prompt fallback: the opener is frozen at session start, so quoting it on every push reads as a reply to the session's first message — a banner title contributes nothing instead.
+### Titles
+
+Not every CLI sets a useful terminal title: pi shows `π - <user>`, hermes shows `π - <dir>`, codex shows the directory, a fresh Claude Code shows its own name. When herdr's title says nothing, the session's opening prompt is used instead — skipping the synthetic context (`AGENTS.md` dumps, `<user_info>` blocks) that agents front-load as user messages. A pane that has not been asked anything yet legitimately has no title either way.
+
+Firstmate mode skips this opening-prompt fallback: the opener is frozen at session start, so quoting it on every push reads as a reply to the session's first message — a banner title contributes nothing instead.
 
 ## Install
 
@@ -110,7 +157,17 @@ herdr plugin action invoke telegram.bridge.test
 
 Run `python3 bot.py --doctor` to check the local runtime and configuration. Add `--telegram` to verify the bot token with Telegram `getMe`; add `--send-test` only when you want a test message sent.
 
-Everything else has a working default. [`config.example.toml`](config.example.toml) documents the full set: which `statuses` notify, an `agents` filter, `settle_ms`, `quiet_seconds`, `snippet_chars`, `markdown` / `fold` / `max_messages`, `replies` / `reply_to_latest` / `allowed_user_ids` / `read_lines`, `accept_files` / `inbox_days` / `max_file_mb`, `[watch] poll_seconds` for the poll-based watcher, `[stt]` for transcribing voice notes via any OpenAI-compatible endpoint (groq by default), `[tts]` for speaking replies via an OpenAI-shaped or Cloudflare Workers AI TTS API, and `proxy` / `api_base` if you need to reach Telegram through something else.
+Everything else has a working default. [`config.example.toml`](config.example.toml) documents the full set:
+
+- which `statuses` notify, an `agents` filter
+- `settle_ms`, `quiet_seconds`, `snippet_chars`
+- `markdown` / `fold` / `max_messages`
+- `replies` / `reply_to_latest` / `allowed_user_ids` / `read_lines`
+- `accept_files` / `inbox_days` / `max_file_mb`
+- `[watch] poll_seconds` for the poll-based watcher
+- `[stt]` for transcribing voice notes via any OpenAI-compatible endpoint (groq by default)
+- `[tts]` for speaking replies via an OpenAI-shaped or Cloudflare Workers AI TTS API
+- `proxy` / `api_base` if you need to reach Telegram through something else
 
 To use the bot in a group rather than a private chat, disable its privacy mode in @BotFather (`/setprivacy`) — and note that everyone in that group can then drive your agents unless you set `allowed_user_ids`.
 
@@ -160,10 +217,12 @@ works, an unsettle flap, a debounce, a filtered status or agent, a send failure 
 logs its reason. "The pane finished but the phone never rang" is always answerable
 from the log.
 
-Sampling statuses can still miss a completion twice over: a turn that starts *and*
-ends between two polls never changes the sampled status (`idle → idle`), and a
-missing herdr event leaves the diff with nothing to say. So with
-`[watch] content_delivery = true` (the default), each poll also runs a
+Sampling statuses can still miss a completion twice over:
+
+- a turn that starts *and* ends between two polls never changes the sampled status (`idle → idle`), and
+- a missing herdr event leaves the diff with nothing to say.
+
+So with `[watch] content_delivery = true` (the default), each poll also runs a
 **content-anchored pass**: it resolves every pane's transcript — the same per-CLI
 resolution the notification snippet uses, pi's cwd-keyed fallback included — and
 tracks the identity of the pane's *last assistant message* (the CLI's message id,
@@ -171,6 +230,7 @@ else a hash of the text, plus its timestamp). A new final message that has never
 been pushed, on a pane observed idle or done, pushes through the same shared path;
 while the pane reads working the message is held until it goes quiet.
 Firstmate-mode Codex additionally delivers explicitly completed public messages while the main pane is working, as described under [Firstmate posture](#firstmate-posture).
+
 Delivery is deduped strictly by message identity through a
 shared sent-marker that the event hook, the status diff and the content pass all
 check and stamp: one finished message, exactly one push, no matter which path
@@ -184,23 +244,22 @@ pane's last message — and under firstmate mode that was proven lossy
 user-facing text messages** (narration between tool calls), and a pipeline
 that only ever delivers "the last message" silently dropped every superseded
 intermediate — whether one arrived at all depended on a poll luckily catching
-the pane idle while it was newest. So under firstmate mode the main pane
-(non-codex CLIs) runs the **mid-run relay**: delivery is text-block-driven.
+the pane idle while it was newest.
+
+So under firstmate mode the main pane (non-codex CLIs) runs the **mid-run
+relay**: delivery is text-block-driven.
 Every sealed assistant text block in the session jsonl is a user-facing
 message, complete the moment its parseable record lands — thinking and
 tool-call records never qualify — and every message after the delivery
 boundary relays exactly once, in transcript order, with or without any status
-change. Interior messages push immediately, even while the pane works; the
-transcript *tail* keeps the hold-while-working rule (it may still be
-superseded; it delivers as the final reply on the first idle/done
-observation). A done/idle status push defers behind an undelivered message so
-the final never jumps ahead of the intermediates it follows, Calm's narration
-rule covers mid-run messages exactly as it does the live transcript, and the
-same shared sent-marker dedupes everything. A delivery boundary the
-transcript can no longer locate (the session rolled over, no parseable
-timestamp) falls back to that sent-marker and drains any never-delivered
-backlog oldest-first, at most 8 messages per poll — flood-safe, and nothing
-is dropped for being old. Relayed mid-run messages follow the normal `[tts]`
+change.
+
+- Interior messages push immediately, even while the pane works; the transcript *tail* keeps the hold-while-working rule (it may still be superseded; it delivers as the final reply on the first idle/done observation).
+- A done/idle status push defers behind an undelivered message so the final never jumps ahead of the intermediates it follows.
+- Calm's narration rule covers mid-run messages exactly as it does the live transcript, and the same shared sent-marker dedupes everything.
+- A delivery boundary the transcript can no longer locate (the session rolled over, no parseable timestamp) falls back to that sent-marker and drains any never-delivered backlog oldest-first, at most 8 messages per poll — flood-safe, and nothing is dropped for being old.
+
+Relayed mid-run messages follow the normal `[tts]`
 speak path; `[tts] speak_final_only = true` keeps mid-run messages text-only.
 The shipped `false` default speaks each delivered message. With `[firstmate] enabled = false` none of this
 exists — the upstream single-slot behavior is exactly as before.
@@ -210,8 +269,10 @@ records is bounded by the sent-marker, not by whatever the transcript happens to
 hold. If the pane's current final message is newer than the last one the phone
 actually received — the exact state a watcher freeze mid-message leaves behind —
 the restart delivers it instead of priming it (held while the pane works unless the Firstmate Codex completion path proves the message complete,
-and a message the marker has already recorded is never re-sent). And the watcher
-keeps itself honest about stalls: every subprocess it runs is group-killed at a
+and a message the marker has already recorded is never re-sent).
+
+The watcher keeps itself honest about stalls: every subprocess it runs is
+group-killed at a
 hard timeout (a herdr helper that inherits the output pipe outlives the CLI and
 turns `subprocess.run`'s own timeout into a permanent hang), and a poll cycle
 that exceeds `2 × poll_seconds` logs `watch: slow cycle …` loudly — a frozen
@@ -228,7 +289,8 @@ A few behaviours of the surrounding systems are worth writing down, because each
 - **grok files sessions under a url-encoded cwd, not a session id**, and herdr reports no session reference for it — so several conversations share a directory, and a brand new one has no transcript until its first reply lands. Picking the newest by mtime hands back the *previous* conversation, so the session is instead pinned by asking the pane's grok process which `events.jsonl` it holds open.
 - **`getUpdates` serves ~24h of backlog on first run.** That is skipped, so the messages you sent the bot while setting up `chat_id` never arrive as prompts.
 - **A voice note is one outbound multipart POST.** Telegram voice notes are Ogg/Opus, which the OpenAI-compatible transcription endpoints take natively (Groq's Whisper among them) — no transcoding, no ffmpeg. The API key rides to curl in a 0600 header file (`-H @file`), never in argv, and every diagnostic string is blanked of it before logging — the same hygiene the bot token gets.
-- **Spoken replies are one JSON POST, converted only when needed.** Cloudflare Workers AI has no OpenAI-compatible speech route (`.../ai/v1/audio/speech` → 400), so the cloudflare provider speaks the native `/ai/run/{model}` shape with *both* input spellings (`text` for Deepgram Aura, `prompt` for melotts) — the model families each reject the other's field alone but accept the pair. Whatever arrives that is not already Ogg/Opus converts through ffmpeg; an OpenAI-shaped provider with `response_format = "opus"` needs no conversion at all. The key gets the same `-H @file` hygiene as every other credential.
+- **Spoken replies are one JSON POST.** Cloudflare Workers AI has no OpenAI-compatible speech route (`.../ai/v1/audio/speech` → 400), so the cloudflare provider speaks the native `/ai/run/{model}` shape with *both* input spellings (`text` for Deepgram Aura, `prompt` for melotts) — the model families each reject the other's field alone but accept the pair.
+- **Spoken audio converts only when needed.** Whatever arrives that is not already Ogg/Opus converts through ffmpeg; an OpenAI-shaped provider with `response_format = "opus"` needs no conversion at all. The key gets the same `-H @file` hygiene as every other credential.
 
 Logs are in `bridge.log` in the plugin state dir, plus `herdr plugin logs --plugin telegram.bridge`.
 
@@ -277,34 +339,16 @@ if the main pane can't be resolved, nothing relays (fail closed).
   a refused pane costs nothing (not even settle/debounce work). There is no config
   key to turn worker notifications back on; an older `[firstmate] worker_notify`
   setting is ignored, and startup logs a warning naming it if present.
-- **Codex without a Herdr session reference.** Run `codex_binding.py` from a tool
-  shell **inside the primary Codex conversation**, using the bridge's config and
-  state directories (see [deployment](deploy/README.md#codex-main-session-binding)).
-  A managed app-server tool shell additionally needs `--primary-session UUID`,
-  supplied by the primary owner from that conversation's verified native
-  reference. The caller's native thread must match, and its nearest Codex must
-  be the installed managed app-server with a validated process lifetime. Workers
-  cannot supply the authority or borrow a more distant main ancestor.
-  It records that conversation's native `CODEX_THREAD_ID` in `codex_main.json`,
-  bound to the live main pane and Codex process start time. Explicit Herdr
-  references still take priority. Two conversations may share a cwd: the binding
-  selects one exact id, never the newest rollout or a matching title. On each
-  read, a changed foreground or bound app-server process, missing/duplicate rollout, or changed competing
-  same-cwd rollout refuses delivery until the current primary conversation
-  rebinds. This includes creating or resuming a different session in the same
-  process; same-cwd worker activity also refuses rather than guessing. Sessions
-  in other worktrees do not invalidate it. Rebind after switching conversations;
-  do not copy a worker's thread id or install an old binding snapshot. Unresolved
-  Codex completions log a reason and send no empty completion banner. Pi and
-  default-off behavior keep their existing resolution and framing.
+- **Codex without a Herdr session reference.** Run `codex_binding.py` from a tool shell **inside the primary Codex conversation**, using the bridge's config and state directories (see [deployment](deploy/README.md#codex-main-session-binding)). A managed app-server tool shell additionally needs `--primary-session UUID`, supplied by the primary owner from that conversation's verified native reference.
+  - The caller's native thread must match, and its nearest Codex must be the installed managed app-server with a validated process lifetime. Workers cannot supply the authority or borrow a more distant main ancestor.
+  - It records that conversation's native `CODEX_THREAD_ID` in `codex_main.json`, bound to the live main pane and Codex process start time. Explicit Herdr references still take priority. Two conversations may share a cwd: the binding selects one exact id, never the newest rollout or a matching title.
+  - On each read, a changed foreground or bound app-server process, missing/duplicate rollout, or changed competing same-cwd rollout refuses delivery until the current primary conversation rebinds. This includes creating or resuming a different session in the same process; same-cwd worker activity also refuses rather than guessing. Sessions in other worktrees do not invalidate it.
+  - Rebind after switching conversations; do not copy a worker's thread id or install an old binding snapshot. Unresolved Codex completions log a reason and send no empty completion banner. Pi and default-off behavior keep their existing resolution and framing.
 - **Complete Codex chat updates during work.** With the content pass enabled, the trusted main Codex session can send complete commentary and answer messages while its pane is working.
-  Each update requires a sealed native `item_completed` record for a public `AgentMessage` paired with the persisted assistant `response_item`, matching message id, phase and text, the exact thread, and turn metadata when supplied.
-  Started items, deltas, unsealed or mismatched records, reasoning, tool output, private agent-to-agent chat, and worker panes cannot qualify.
-  The watcher sends undelivered complete pairs in transcript order through `notify.deliver()`, rechecking the same session and completion evidence before sending.
-  Message identities remain shared with final/status notifications, and only successful sends advance the sent marker and delivery boundary; failures retry without skipping the following update.
-  A fresh install primes existing history, while a restart with delivery history resumes after its recorded boundary.
-  Reads use a bounded transcript tail; a complete pair must fit in that tail, and an unavailable native delivery boundary refuses updates with a logged reason until a normal final establishes one.
-  This provides message completion during a long turn; it does not refresh an expired pane/session binding or infer completion from inactivity.
+  - Each update requires a sealed native `item_completed` record for a public `AgentMessage` paired with the persisted assistant `response_item`, matching message id, phase and text, the exact thread, and turn metadata when supplied. Started items, deltas, unsealed or mismatched records, reasoning, tool output, private agent-to-agent chat, and worker panes cannot qualify.
+  - The watcher sends undelivered complete pairs in transcript order through `notify.deliver()`, rechecking the same session and completion evidence before sending. Message identities remain shared with final/status notifications, and only successful sends advance the sent marker and delivery boundary; failures retry without skipping the following update.
+  - A fresh install primes existing history, while a restart with delivery history resumes after its recorded boundary. Reads use a bounded transcript tail; a complete pair must fit in that tail, and an unavailable native delivery boundary refuses updates with a logged reason until a normal final establishes one.
+  - This provides message completion during a long turn; it does not refresh an expired pane/session binding or infer completion from inactivity.
 - **Mid-run relay for every other main-pane CLI** (pi, Claude, generic jsonl shapes): the same completeness guarantee from the session formats' own records — a sealed text block is a finished user-facing message, thinking/tool-call records never qualify. Every message after the delivery boundary relays exactly once, in transcript order; interiors push immediately while the pane works, the transcript tail holds until the pane reads idle/done (it may still be superseded), and a status completion defers behind an undelivered message so the phone reads in order. `[tts] speak_final_only = true` keeps mid-run relays text-only while finals still speak. The shipped `false` default speaks every delivered message. With firstmate mode off this path does not exist (upstream behavior).
 - **Workers are addressable only as context.** A plain (non-reply) message goes to
   the main pane — always, including the very first message on a brand-new install
@@ -325,7 +369,12 @@ if the main pane can't be resolved, nothing relays (fail closed).
  a clear error (“notify-only degrade”). This keeps a group chat from turning into
  a fleet remote control. Note the key stays at the *top level* of `config.toml` —
  it is not read from inside `[firstmate]`.
-- **Standalone notification framing.** Every push reads as a fresh standalone message, never as a reply to old session content. Three firstmate-mode defaults make that so: the header never carries the session's opening prompt (it is the session's *first* message and stays frozen there — quoting it on every push reads as a reply to it; a CLI banner title contributes nothing instead), long replies are **not** folded — Telegram renders an expandable blockquote like a reply quote, so the body goes out as plain rendered text with syntax-highlighted code — and the **main pane's push carries no header line at all**: `✅ pi · /cwd` names the one pane you can already reply to, so the final reply is the whole message. Under firstmate mode the main pane is also the only pane that pushes at all. An explicit top-level `fold` key still wins if an operator wants folding back, and `[firstmate] main_header = true` restores the main pane's header; with `[firstmate] enabled = false` all of these are exactly upstream's (opener fallback, `fold = "auto"`, full headers).
+- **Standalone notification framing.** Every push reads as a fresh standalone message, never as a reply to old session content. Three firstmate-mode defaults make that so:
+  - the header never carries the session's opening prompt (it is the session's *first* message and stays frozen there — quoting it on every push reads as a reply to it; a CLI banner title contributes nothing instead);
+  - long replies are **not** folded — Telegram renders an expandable blockquote like a reply quote, so the body goes out as plain rendered text with syntax-highlighted code;
+  - the **main pane's push carries no header line at all**: `✅ pi · /cwd` names the one pane you can already reply to, so the final reply is the whole message.
+
+  Under firstmate mode the main pane is also the only pane that pushes at all. An explicit top-level `fold` key still wins if an operator wants folding back, and `[firstmate] main_header = true` restores the main pane's header; with `[firstmate] enabled = false` all of these are exactly upstream's (opener fallback, `fold = "auto"`, full headers).
 - **Calm-aware excerpts.** If the firstmate home's Calm preference
  (`config/calm` in the home, values `on`/`off`, absent = off) is on, notification
  bodies for firstmate-home panes obey Calm's preservation rule: mid-turn

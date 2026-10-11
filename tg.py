@@ -6,6 +6,7 @@ plugin paths, logging, config, the Telegram API call, the herdr CLI call, and th
 message -> agent map that lets a Telegram reply find its way back to a pane.
 """
 
+import contextlib
 import fcntl
 import json
 import os
@@ -572,6 +573,93 @@ def write_state(name: str, obj) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f)
     os.replace(tmp, state_path(name))
+
+
+def lock_ex(path: str) -> int:
+    """Take an exclusive flock on `path`, creating it if absent -> held fd.
+
+    The inode is re-verified once the lock lands because prune_lock_dir()
+    removes lock files by unlinking: a waiter can wake holding an inode that is
+    no longer the file at `path`, and without the recheck two processes could
+    each hold "the" lock on different inodes. On a mismatch the fd is dropped
+    and the fresh path retaken.
+    """
+    while True:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            raise
+        try:
+            if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                return fd
+        except FileNotFoundError:
+            pass
+        os.close(fd)
+
+
+def unlock(fd: int) -> None:
+    """Drop a lock_ex hold. Closing the fd alone would release it too; the
+    explicit unlock marks where exclusion ends."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def prune_lock_dir(directory: str, max_files: int, idle_secs: float) -> None:
+    """Keep a directory of flock files bounded: past max_files, unlink files
+    that are old and currently unlocked. Lock files are never rewritten, so
+    mtime is creation time and "old" means no delivery touched that key
+    recently. Unlinking only while holding the lock — together with lock_ex's
+    inode recheck on the waiter side — keeps exclusion intact across a prune.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    if len(names) <= max_files:
+        return
+    now = time.time()
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            if now - os.stat(path).st_mtime < idle_secs:
+                continue
+            fd = os.open(path, os.O_RDWR)  # no O_CREAT: only existing locks
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)  # held right now — leave it alone
+            continue
+        try:
+            if os.stat(path).st_ino == os.fstat(fd).st_ino:
+                os.unlink(path)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def state_file_lock(name: str):
+    """Serialize one state file's read-modify-write cycle across processes.
+
+    write_state's atomic replace keeps any single file readable mid-update,
+    but two processes that both read, merge and rewrite the same JSON can drop
+    whichever merge landed first — and a dropped sent-marker stamp is a double
+    send waiting to happen. One lock file per state file, held only for the
+    merge itself: a leaf lock nothing re-enters, so it cannot deadlock against
+    the delivery locks its callers may already hold.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = lock_ex(state_path(name + ".lock"))
+    try:
+        yield
+    finally:
+        unlock(fd)
 
 
 # --- message -> agent routing ------------------------------------------------

@@ -1,10 +1,11 @@
-"""Offline voice/STT tests: the Groq call is stubbed at the curl seam (stt._curl),
-herdr and the Telegram API at the tg module boundary as everywhere else in this
-suite. The contract under test: a voice note rides the exact same routing as typed
-text (main-pane-only under firstmate mode, worker context prefix, caption
-semantics), the Groq request carries the verified multipart shape with the key out
-of argv, and every failure mode reaches the operator instead of dropping the note
-silently. No network, no real key."""
+"""Offline voice/STT tests: the provider transcription call is stubbed at the curl
+seam (stt._curl), herdr and the Telegram API at the tg module boundary as
+everywhere else in this suite. The contract under test: a voice note rides the
+exact same routing as typed text (main-pane-only under firstmate mode, worker
+context prefix, caption semantics), the transcription request carries the verified
+OpenAI multipart shape with the key out of argv for every supported provider, and
+every failure mode reaches the operator instead of dropping the note silently. No
+network, no real key."""
 
 import os
 import subprocess
@@ -23,6 +24,7 @@ TASK = ("bridge-voice-groq", WORKER, "ship", ["working [at=1790000000]: implemen
 WORKER_CTX = f"[opencode/bridge-voice-groq pane {WORKER}]"
 GROQ_KEY = "gsk_test_0123456789"
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
 REAL_CURL = stt._curl
 
 
@@ -197,6 +199,60 @@ class TestGroqRequest(VoiceCase):
         self.assertEqual(self.curl.argvs, [])
 
 
+class TestProviderDispatch(VoiceCase):
+    """Provider dispatch: every supported provider speaks the same OpenAI multipart
+    shape — only the per-provider defaults differ, and base_url/model win."""
+
+    def setUp(self):
+        super().setUp()
+        self.audio = os.path.join(tempfile.mkdtemp(prefix="fm-voice-ogg-"), "note.ogg")
+        with open(self.audio, "wb") as f:
+            f.write(b"OggS")
+
+    def test_openai_default_shape(self):
+        """provider="openai" speaks the standard OpenAI audio-transcriptions shape."""
+        text, err = stt.transcribe(self.cfg(provider="openai"), self.audio)
+        self.assertEqual((text, err), ("hello from the phone", ""))
+        cmd = self.curl.argvs[0]
+        self.assertIn(OPENAI_URL, cmd)
+        self.assertIn("model=whisper-1", cmd)
+        self.assertIn("response_format=json", cmd)
+        self.assertIn(f"file=@{self.audio}", cmd)
+
+    def test_groq_remains_the_default_provider(self):
+        stt.transcribe(self.cfg(), self.audio)
+        cmd = self.curl.argvs[0]
+        self.assertIn(GROQ_URL, cmd)
+        self.assertIn("model=whisper-large-v3-turbo", cmd)
+
+    def test_base_url_override_honored_for_both_providers(self):
+        stt.transcribe(self.cfg(provider="openai", base_url="https://gw.example/v1/"),
+                       self.audio)
+        self.assertIn("https://gw.example/v1/audio/transcriptions", self.curl.argvs[0])
+        stt.transcribe(self.cfg(base_url="https://gw.example/v1"), self.audio)
+        self.assertIn("https://gw.example/v1/audio/transcriptions", self.curl.argvs[1])
+
+    def test_openai_model_override_forwarded(self):
+        stt.transcribe(self.cfg(provider="openai", model="gpt-4o-transcribe"), self.audio)
+        cmd = self.curl.argvs[0]
+        self.assertIn("model=gpt-4o-transcribe", cmd)
+        self.assertNotIn("model=whisper-1", cmd)
+
+    def test_provider_value_normalized(self):
+        stt.transcribe(self.cfg(provider="  OpenAI "), self.audio)
+        self.assertIn(OPENAI_URL, self.curl.argvs[0])
+        self.assertEqual(stt.startup_warnings(self.cfg(provider="OpenAI")), [])
+
+    def test_openai_config_has_no_startup_warnings(self):
+        self.assertEqual(stt.startup_warnings(self.cfg(provider="openai")), [])
+
+    def test_unsupported_provider_refused_with_supported_list(self):
+        err = stt.config_error(self.cfg(provider="deepgram"))
+        self.assertIn('unknown stt provider "deepgram"', err)
+        self.assertIn('"groq"', err)
+        self.assertIn('"openai"', err)
+
+
 class TestPromptSemantics(VoiceCase):
     """hermes gateway semantics for what a transcript becomes."""
 
@@ -322,7 +378,7 @@ class TestVoiceFailures(VoiceCase):
         config = self.cfg(provider="deepgram")
         warnings = stt.startup_warnings(config)
         self.assertEqual(len(warnings), 1)
-        self.assertIn('only "groq" is supported', warnings[0])
+        self.assertIn('unknown stt provider "deepgram"', warnings[0])
         bot.handle_message(config, voice_msg())
         self.assertEqual(self.herdr.prompts(), [])
         self.assertEqual(self.curl.argvs, [])

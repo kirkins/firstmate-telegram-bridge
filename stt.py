@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Speech-to-text for Telegram voice notes, Groq only.
+"""Speech-to-text for Telegram voice notes, via an OpenAI-compatible endpoint.
 
 Ported from internal gateway's gateway voice path minus everything we don't need: no
 local faster-whisper fallback, no provider autodetect ladder, no transcoding —
-one multipart POST to Groq's OpenAI-compatible audio/transcriptions endpoint
-(default model whisper-large-v3-turbo; Telegram voice notes are Ogg/Opus, which
-the endpoint takes natively). The transcript is submitted to the agent exactly
+one multipart POST to the configured provider's OpenAI-compatible
+audio/transcriptions endpoint (Telegram voice notes are Ogg/Opus, which the
+endpoint takes natively). Every supported provider speaks that same standard
+shape, so only the defaults differ: "groq" is the tested convenience
+(whisper-large-v3-turbo at api.groq.com), "openai" the plain OpenAI API
+(whisper-1 at api.openai.com), and a base_url override points either at any
+other compatible gateway. The transcript is submitted to the agent exactly
 like a typed reply — see bot.handle_voice for the routing.
 
 The API key lives only in config.toml's [stt] table (mode 600, next to
@@ -22,9 +26,17 @@ import tempfile
 
 import tg
 
-SUPPORTED_PROVIDERS = {"groq"}
-DEFAULT_MODEL = "whisper-large-v3-turbo"
-DEFAULT_BASE = "https://api.groq.com/openai/v1"
+# One provider table, because every provider speaks the same OpenAI
+# audio/transcriptions shape: only the defaults differ, and a base_url or model
+# override always wins — that is what makes any other OpenAI-compatible
+# transcription gateway usable with either provider value.
+PROVIDER_DEFAULTS = {
+    "groq": {"model": "whisper-large-v3-turbo",   # the tested default convenience
+             "base_url": "https://api.groq.com/openai/v1"},
+    "openai": {"model": "whisper-1",              # the plain OpenAI API
+               "base_url": "https://api.openai.com/v1"},
+}
+SUPPORTED_PROVIDERS = set(PROVIDER_DEFAULTS)
 DEFAULT_TIMEOUT = 90  # longer than tg's 20s API calls: long clips upload slowly
 
 # internal gateway gateway semantics (run_inbound.py): an empty/whitespace transcript
@@ -66,7 +78,8 @@ def config_error(cfg: dict) -> str:
     section = stt_config(cfg)
     who = provider(cfg)
     if who not in SUPPORTED_PROVIDERS:
-        return f'unknown stt provider "{who}" — only "groq" is supported'
+        return (f'unknown stt provider "{who}" — supported providers: '
+                + ", ".join(sorted(f'"{p}"' for p in SUPPORTED_PROVIDERS)))
     if not api_key(section):
         return "stt.api_key is not set"
     return ""
@@ -86,7 +99,7 @@ def redact(text: str, section: dict) -> str:
     return text.replace(key, "<stt-key>") if key else text
 
 
-# --- the Groq call --------------------------------------------------------------
+# --- the transcription call -----------------------------------------------------
 
 
 def _header_file(section: dict) -> str:
@@ -105,7 +118,7 @@ def _curl(cmd, timeout):
 
 
 def transcribe(cfg: dict, audio_path: str) -> tuple[str, str]:
-    """POST one audio file to the Groq transcription endpoint -> (transcript, error).
+    """POST one audio file to the provider's transcription endpoint -> (transcript, error).
 
     The transcript comes back verbatim and may be empty/whitespace — callers apply
     the empty-sentinel. On failure the error string is key-redacted and safe to log.
@@ -113,8 +126,11 @@ def transcribe(cfg: dict, audio_path: str) -> tuple[str, str]:
     section = stt_config(cfg)
     if not api_key(section):
         return "", "stt.api_key is not set"
-    model = str(section.get("model", "") or DEFAULT_MODEL)
-    base = str(section.get("base_url", "") or DEFAULT_BASE).rstrip("/")
+    # bot.py only transcribes after config_error cleared the provider; an unknown
+    # one falls back to the tested defaults rather than guessing a gateway.
+    defaults = PROVIDER_DEFAULTS.get(provider(cfg), PROVIDER_DEFAULTS["groq"])
+    model = str(section.get("model", "") or defaults["model"])
+    base = str(section.get("base_url", "") or defaults["base_url"]).rstrip("/")
     language = str(section.get("language", "") or "").strip()
     try:
         timeout = int(section.get("timeout_secs", 0) or DEFAULT_TIMEOUT)

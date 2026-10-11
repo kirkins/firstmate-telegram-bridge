@@ -229,23 +229,36 @@ allow_worker_esc = false
 
 # --- voice messages ----------------------------------------------------------
 #
-# With this section present and enabled, a voice note is transcribed with the Groq
-# Whisper API and the transcript is submitted exactly like a typed reply — same
-# routing, same reply threading; the audio file itself is still saved to the inbox
-# either way. With the section absent, or enabled = false, a voice note is just an
-# attachment: saved, and the agent handed its path.
+# With this section present and enabled, a voice note is transcribed through an
+# OpenAI-compatible audio-transcriptions API and the transcript is submitted
+# exactly like a typed reply — same routing, same reply threading; the audio
+# file itself is still saved to the inbox either way. With the section absent,
+# or enabled = false, a voice note is just an attachment: saved, and the agent
+# handed its path.
 [stt]
 enabled = true
-# Only "groq" is supported for now; anything else is refused loudly (in the log
-# at startup, and to the chat when a voice note arrives) rather than guessed at.
+# Which OpenAI-shaped transcription API to speak — both are the same shape, one
+# multipart POST to {base_url}/audio/transcriptions with the key as a bearer
+# header, so any OpenAI-compatible transcription gateway works:
+#   "groq"   (default, the tested convenience) Groq's Whisper endpoint.
+#   "openai" the plain OpenAI audio API.
+# An unsupported value is refused loudly (in the log at startup, and to the
+# chat when a voice note arrives) rather than guessed at.
 provider = "groq"
-# From console.groq.com (API Keys → Create API Key). Lives only in this file —
-# keep it mode 600 next to bot_token. It is never committed, never logged, never
-# printed: it rides to curl in a 0600 header file, not argv, and error strings are
-# redacted of it before they reach the log or the chat.
+# The endpoint's API key — console.groq.com (API Keys → Create API Key) for
+# groq, platform.openai.com for openai, or the gateway you point base_url at.
+# Lives only in this file — keep it mode 600 next to bot_token. It is never
+# committed, never logged, never printed: it rides to curl in a 0600 header
+# file, not argv, and error strings are redacted of it before they reach the
+# log or the chat.
 api_key = "REPLACE_ME:gsk"
-# Optional model override; whisper-large-v3-turbo is the default and the tested one.
+# Optional model override. Defaults per provider: whisper-large-v3-turbo for
+# groq (the tested one), whisper-1 for openai.
 # model = "whisper-large-v3-turbo"
+# Optional endpoint override. Defaults per provider: https://api.groq.com/openai/v1
+# for groq, https://api.openai.com/v1 for openai. Point it at any other
+# OpenAI-compatible transcription endpoint (and set model to what it serves).
+# base_url = "https://api.groq.com/openai/v1"
 # ISO language hint, e.g. "en". Empty (default) lets the model auto-detect, which
 # misreads short clips more often.
 # language = ""

@@ -717,11 +717,15 @@ def recently_sent(key: str, quiet_seconds: int) -> bool:
     if quiet_seconds <= 0:
         return False
     now = time.time()
-    seen = tg.read_state("last_sent.json", {})
-    last = seen.get(key, 0)
-    seen = {k: v for k, v in seen.items() if now - v < 3600}
-    seen[key] = now
-    tg.write_state("last_sent.json", seen)
+    # the stamp is a read-merge-write on a file two processes share: taken under
+    # the file's own lock so one side's key can't be written out from under the
+    # other's merge (the delivery lock serializes one identity, not the file)
+    with tg.state_file_lock("last_sent.json"):
+        seen = tg.read_state("last_sent.json", {})
+        last = seen.get(key, 0)
+        seen = {k: v for k, v in seen.items() if now - v < 3600}
+        seen[key] = now
+        tg.write_state("last_sent.json", seen)
     return now - last < quiet_seconds
 
 
@@ -758,13 +762,86 @@ def last_delivered(pane_id: str) -> str:
 
 def mark_content_sent(pane_id: str, identity: str) -> None:
     now = time.time()
-    seen = {k: t for k, t in tg.read_state(CONTENT_SENT, {}).items()
-            if now - t < CONTENT_SENT_SECS}
-    seen[content_key(pane_id, identity)] = now
-    if len(seen) > CONTENT_SENT_MAX:
-        for k in sorted(seen, key=seen.get)[:len(seen) - CONTENT_SENT_MAX]:
-            del seen[k]
-    tg.write_state(CONTENT_SENT, seen)
+    key = content_key(pane_id, identity)
+    # read-merge-write under the file's own lock: two identities delivering at
+    # once (each correctly serialized per identity) must not drop each other's
+    # stamps out of the shared marker file
+    with tg.state_file_lock(CONTENT_SENT):
+        seen = {k: t for k, t in tg.read_state(CONTENT_SENT, {}).items()
+                if now - t < CONTENT_SENT_SECS}
+        seen[key] = now
+        if len(seen) > CONTENT_SENT_MAX:
+            for k in sorted(seen, key=seen.get)[:len(seen) - CONTENT_SENT_MAX]:
+                del seen[k]
+        tg.write_state(CONTENT_SENT, seen)
+
+
+# Cross-process delivery serialization. The event hook (this file's main, a
+# separate herdr plugin process) and the watcher (bot.py's status-watcher
+# thread) both land in deliver() for the same pane and message, and the
+# sent-marker above is a plain JSON file: check, send, stamp with nothing
+# keeping the two processes apart means both can pass the check while the
+# first's Telegram send is still on the wire — a window of hundreds of
+# milliseconds, the whole HTTP send — and the phone hears one completion
+# twice, spoken twice in voice mode. The debounce cannot close it either: its
+# keys differ by origin for non-Codex panes, and its own stamp is an
+# unguarded read-merge-write. One exclusive flock per pane:content identity
+# closes the window: the second delivery waits for the first's stamp, then
+# the re-check reads the marker and skips.
+DELIVER_LOCKS = "deliver-locks"   # dir under the state dir, one 0-byte file per identity
+DELIVER_LOCK_MAX = 256            # past this many files, idle ones are pruned
+DELIVER_LOCK_IDLE = 3600          # ...at least this old (nothing rewrites them)
+
+# lock path -> [re-entry depth, fd]; deliver() is single-threaded per process
+# (the hook process and the watcher thread each run it alone), so a plain dict
+# tracks the holds without needing a guard of its own
+_held_delivery_locks: dict[str, list] = {}
+
+
+def delivery_lock_path(pane_id: str, content_id: str) -> str:
+    """The flock file for one delivery identity. Hashed because pane ids and
+    message identities are arbitrary text, and the state dir wants a flat,
+    bounded set of boring names."""
+    digest = hashlib.sha256(content_key(pane_id, content_id).encode()).hexdigest()[:32]
+    return os.path.join(tg.state_path(DELIVER_LOCKS), f"{digest}.lock")
+
+
+def acquire_delivery_lock(pane_id: str, content_id: str) -> str | None:
+    """Take the identity's delivery lock -> its path, for release_delivery_lock
+    (None when there is no identity to key a lock on).
+
+    Re-entrant on purpose: flock excludes other processes and other threads,
+    but a deliver() invoked from inside another deliver()'s send boundary —
+    the overlapping-completion shape the tests drive, the only nesting this
+    code has — runs on this same thread and would deadlock against its own
+    lock. There the debounce's pre-send stamp already marks the identity in
+    flight, so the nested pass re-enters instead of blocking, exactly as it
+    did before the lock existed.
+    """
+    path = delivery_lock_path(pane_id, content_id)
+    held = _held_delivery_locks.get(path)
+    if held:
+        held[0] += 1
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _held_delivery_locks[path] = [1, tg.lock_ex(path)]
+    return path
+
+
+def release_delivery_lock(path: str | None) -> None:
+    """Drop one acquire_delivery_lock hold; the outermost release frees the
+    flock and prunes the lock directory back under its cap."""
+    if path is None:
+        return
+    held = _held_delivery_locks.get(path)
+    if not held:
+        return
+    if held[0] > 1:
+        held[0] -= 1
+        return
+    del _held_delivery_locks[path]
+    tg.unlock(held[1])
+    tg.prune_lock_dir(tg.state_path(DELIVER_LOCKS), DELIVER_LOCK_MAX, DELIVER_LOCK_IDLE)
 
 
 def deliver(cfg: dict, pane_id: str, status: str, prev: str,
@@ -775,8 +852,9 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
     """The one send path for pane and sealed-message notifications, shared by the event
     hook (main below), the poll-based status diff (watch.py), the content
     pass and the mid-run relay (also watch.py): classification, the statuses/agents
-    filters, the firstmate posture, the sent-marker dedupe, the settle re-check, the quiet
-    debounce and the reply-map target all live here so the paths cannot drift
+    filters, the firstmate posture, the cross-process delivery lock, the sent-marker
+    dedupe, the settle re-check, the quiet debounce and the reply-map target all live
+    here so the paths cannot drift
     apart. `prev` is the pane's previous status from last_status.json — the
     caller has already swapped it in. origin="content" skips the settle
     re-check (the pane not working at observation time is that push's flap
@@ -835,68 +913,81 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
             and codex_binding.delivery_denied(pane_id, status, identity, reply, content_id)):
         return False
     content_id = content_id or identity  # the content pass already resolved it
-    if content_id and content_already_sent(pane_id, content_id):
-        tg.log(f"skip pane={pane_id}: final message already pushed ({content_id[:24]})")
-        return False
-    # confirm before the debounce is stamped, so a flap doesn't suppress the real one
-    if origin not in ("content", "completed", "midrun") and not settled(pane_id, status, cfg):
-        return False  # settled() logged the flap
-    if completed and not codex_binding.current_update(cfg, pane_id, agent_info(pane_id), completed_update):
-        tg.log(f"skip pane={pane_id}: completed Codex message/source changed before send; retry")
-        return False
-    if (not completed and firstmate.enabled(cfg) and cli == "codex"
-            and codex_binding.changed_during_settle(cfg, pane_id, identity, reply)):
-        return False
-    # Distinct sealed messages need distinct keys, while all Codex completion
-    # paths must share a key before a successful send can stamp the marker.
-    # Content-keyed deliveries (content/midrun/completed) dedupe on the message
-    # itself: a multi-message turn must not eat its own burst.
-    codex_completion = firstmate.enabled(cfg) and cli == "codex"
-    debounce_key = (f"{pane_id}:completed:{content_id}"
-                    if codex_completion and status == "done" and content_id
-                    else (f"{pane_id}:content:{content_id}"
-                          if origin in ("content", "midrun") and content_id
-                          else f"{pane_id}:{status}"))
-    if recently_sent(debounce_key, int(cfg.get("quiet_seconds", 5))):
-        tg.log(f"debounced pane={pane_id} status={status}")
-        return False
+    # The cross-process delivery lock (see DELIVER_LOCKS above): taken before
+    # the marker read it guards, held through the stamp and the speech after
+    # it (only a same-identity delivery ever waits on it), so exactly one
+    # process runs this check-send-stamp sequence to completion; the other
+    # re-reads the marker once the lock lands and skips. A failed send still
+    # stamps nothing, so a delivery that waited on the lock proceeds and
+    # delivers — the retry semantics ride through the lock, they are not
+    # suppressed by it. A delivery with no resolvable identity has no marker
+    # to guard and no lock.
+    lock = acquire_delivery_lock(pane_id, content_id) if content_id else None
+    try:
+        if content_id and content_already_sent(pane_id, content_id):
+            tg.log(f"skip pane={pane_id}: final message already pushed ({content_id[:24]})")
+            return False
+        # confirm before the debounce is stamped, so a flap doesn't suppress the real one
+        if origin not in ("content", "completed", "midrun") and not settled(pane_id, status, cfg):
+            return False  # settled() logged the flap
+        if completed and not codex_binding.current_update(cfg, pane_id, agent_info(pane_id), completed_update):
+            tg.log(f"skip pane={pane_id}: completed Codex message/source changed before send; retry")
+            return False
+        if (not completed and firstmate.enabled(cfg) and cli == "codex"
+                and codex_binding.changed_during_settle(cfg, pane_id, identity, reply)):
+            return False
+        # Distinct sealed messages need distinct keys, while all Codex completion
+        # paths must share a key before a successful send can stamp the marker.
+        # Content-keyed deliveries (content/midrun/completed) dedupe on the message
+        # itself: a multi-message turn must not eat its own burst.
+        codex_completion = firstmate.enabled(cfg) and cli == "codex"
+        debounce_key = (f"{pane_id}:completed:{content_id}"
+                        if codex_completion and status == "done" and content_id
+                        else (f"{pane_id}:content:{content_id}"
+                              if origin in ("content", "midrun") and content_id
+                              else f"{pane_id}:{status}"))
+        if recently_sent(debounce_key, int(cfg.get("quiet_seconds", 5))):
+            tg.log(f"debounced pane={pane_id} status={status}")
+            return False
 
-    folder = tg.short_home(cwd)
-    # firstmate mode never falls back to the reported title either: it is the same
-    # CLI banner display_title just declined, and the reply map keys on the sent
-    # message, not the header — routing is untouched by what the header says
-    fm = firstmate.enabled(cfg)
-    title = display_title(info, cli, pane_id, firstmate_mode=fm) or ("" if fm else title)
-    reply = tidy(reply)
-    reply = firstmate.calm_excerpt(cfg, pane_id, status, reply)
-    if fm and cli == "codex" and codex_binding.delivery_denied(pane_id, status, identity, reply):
-        return False
+        folder = tg.short_home(cwd)
+        # firstmate mode never falls back to the reported title either: it is the same
+        # CLI banner display_title just declined, and the reply map keys on the sent
+        # message, not the header — routing is untouched by what the header says
+        fm = firstmate.enabled(cfg)
+        title = display_title(info, cli, pane_id, firstmate_mode=fm) or ("" if fm else title)
+        reply = tidy(reply)
+        reply = firstmate.calm_excerpt(cfg, pane_id, status, reply)
+        if fm and cli == "codex" and codex_binding.delivery_denied(pane_id, status, identity, reply):
+            return False
 
-    # one line, so a phone's notification preview spends its few lines on the reply
-    # rather than on metadata. ✅/❓ already says done/blocked; the word is redundant.
-    emoji = tg.STATUS_EMOJI.get(status, "")
-    head = " · ".join(p for p in (f"{emoji} {agent}".strip(), folder or pane_id,
-                                  title[:int(cfg.get("title_chars", 48))]) if p)
-    target = {"pane": pane_id, "agent": agent, "folder": folder}
-    if fm and not firstmate.main_header(cfg):
-        # main pane under firstmate mode (relay_denied has already refused every
-        # other pane): no header line at all when there is a body. There is exactly
-        # one prompt-replyable pane, so "✅ pi · folder" names what the operator
-        # already knows — the body (the final reply) is the whole message. A push
-        # with no body left keeps the header (an empty text would not send, and a
-        # silent drop is worse); [firstmate] main_header = true restores it. The
-        # reply map keys on the sent message, so routing is untouched either way.
-        head = "" if reply else head
-    sent = send_notification(cfg, head, reply, target)
-    if sent:
-        tg.log(f"delivered pane={pane_id} status={status} origin={origin}")
-        if content_id:
-            mark_content_sent(pane_id, content_id)
-        if reply:
-            tts.maybe_speak(cfg, reply, target, intermediate=intermediate)
-    else:
-        tg.log(f"send failed pane={pane_id} status={status} origin={origin} — marker not stamped")
-    return sent
+        # one line, so a phone's notification preview spends its few lines on the reply
+        # rather than on metadata. ✅/❓ already says done/blocked; the word is redundant.
+        emoji = tg.STATUS_EMOJI.get(status, "")
+        head = " · ".join(p for p in (f"{emoji} {agent}".strip(), folder or pane_id,
+                                      title[:int(cfg.get("title_chars", 48))]) if p)
+        target = {"pane": pane_id, "agent": agent, "folder": folder}
+        if fm and not firstmate.main_header(cfg):
+            # main pane under firstmate mode (relay_denied has already refused every
+            # other pane): no header line at all when there is a body. There is exactly
+            # one prompt-replyable pane, so "✅ pi · folder" names what the operator
+            # already knows — the body (the final reply) is the whole message. A push
+            # with no body left keeps the header (an empty text would not send, and a
+            # silent drop is worse); [firstmate] main_header = true restores it. The
+            # reply map keys on the sent message, so routing is untouched either way.
+            head = "" if reply else head
+        sent = send_notification(cfg, head, reply, target)
+        if sent:
+            tg.log(f"delivered pane={pane_id} status={status} origin={origin}")
+            if content_id:
+                mark_content_sent(pane_id, content_id)
+            if reply:
+                tts.maybe_speak(cfg, reply, target, intermediate=intermediate)
+        else:
+            tg.log(f"send failed pane={pane_id} status={status} origin={origin} — marker not stamped")
+        return sent
+    finally:
+        release_delivery_lock(lock)
 
 
 def main() -> None:

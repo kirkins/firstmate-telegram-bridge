@@ -39,7 +39,7 @@ class BindingError(ValueError):
 class Resolution(NamedTuple):
     path: str = ""
     reason: str = ""
-    lifetime: tuple = ()
+    lifetime: tuple | None = None
 
     @property
     def state(self) -> str:
@@ -61,7 +61,7 @@ def _process(pid: int) -> tuple[int, str]:
     return int(fields[1]), fields[19]
 
 
-def _foreground(pane_id: str) -> list[int]:
+def _foreground(pane_id: str, agent: str | None = "codex") -> list[int]:
     result, err = tg.herdr_json("pane", "process-info", "--pane", pane_id, timeout=10)
     if err:
         raise BindingError("pane process-info unavailable")
@@ -69,7 +69,7 @@ def _foreground(pane_id: str) -> list[int]:
     if info.get("pane_id") != pane_id:
         raise BindingError("process-info pane mismatch", "primary_replaced")
     return [p["pid"] for p in info.get("foreground_processes", [])
-            if p.get("name") == "codex" and type(p.get("pid")) is int]
+            if (agent is None or p.get("name") == agent) and type(p.get("pid")) is int]
 
 
 def _ancestor() -> tuple[int, str]:
@@ -190,19 +190,17 @@ def _main(cfg: dict, pane_id: str, info: dict) -> str:
     if (not firstmate.enabled(cfg) or info.get("agent") != "codex" or info.get("cwd") != cwd
             or (info.get("foreground_cwd") or cwd) != cwd):
         raise BindingError("pane is not the primary Codex pane", "primary_replaced")
-    main = firstmate.main_pane_id(cfg)
-    if pane_id != main:
-        _, err = tg.herdr_json("agent", "list", timeout=10)
-        if err:
-            raise BindingError("primary source unavailable")
-        raise BindingError("pane is not the primary Codex pane",
-                           "primary_replaced" if main else "conversation_ambiguous")
+    route = firstmate.main_pane_result(cfg)
+    if not route.target:
+        raise BindingError("primary source unavailable", route.reason)
+    if pane_id != route.target["pane"]:
+        raise BindingError("pane is not the primary Codex pane", "primary_replaced")
     return cwd
 
 
 def binding_result(cfg: dict, pane_id: str, info: dict) -> Resolution:
     """Classify a read without changing the binding or choosing a replacement."""
-    lifetime = ()
+    lifetime = None
     try:
         cwd = _main(cfg, pane_id, info)
         foreground = _foreground(pane_id)
@@ -265,11 +263,6 @@ def source_result(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) 
     """An explicit exact reference takes priority, including when unavailable."""
     if not session.get("value"):
         return binding_result(cfg, pane_id, info)
-    lifetime = ()
-    try:
-        lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(_foreground(pane_id)))
-    except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
-        pass  # An explicit reference retains its existing process-independent priority.
     try:
         if session.get("kind") == "path":
             path = session["value"] if os.path.isfile(session["value"]) else ""
@@ -280,12 +273,19 @@ def source_result(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) 
         if path:
             with open(path, "rb") as stream:
                 stream.read(1)
-        return Resolution(path, "" if path else "source_unavailable", lifetime)
+            return Resolution(path)
+        reason = "source_unavailable"
     except BindingError as e:
         reason = "conversation_ambiguous" if e.reason == "missing_binding" else e.reason
-        return Resolution(reason=reason, lifetime=lifetime)
     except (OSError, ValueError, TypeError):
-        return Resolution(reason="source_unavailable", lifetime=lifetime)
+        reason = "source_unavailable"
+    lifetime = None
+    if reason != "source_unavailable":
+        try:
+            lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(_foreground(pane_id)))
+        except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+            pass
+    return Resolution(reason=reason, lifetime=lifetime)
 
 
 def session_path(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) -> str:
@@ -487,19 +487,17 @@ def main() -> None:
         # Read configuration without resolving any bot/STT credentials.
         with open(os.path.join(tg.CONFIG_DIR, "config.toml"), "rb") as f:
             cfg = tomllib.load(f)
-        pane_id = firstmate.main_pane_id(cfg)
-        result, err = tg.herdr_json("agent", "get", pane_id, timeout=10)
+        route = firstmate.main_pane_result(cfg)
+        pane_id = route.target["pane"] if route.target else ""
+        result, err = (tg.herdr_json("agent", "get", pane_id, timeout=10)
+                       if pane_id else ({}, "primary pane unavailable"))
         checking = sys.argv[1:] == ["--check"]
         if err and not checking:
             raise BindingError("primary pane unavailable")
         if checking:
             info = result.get("agent", {})
             if err or not pane_id:
-                agents, unavailable = tg.herdr_json("agent", "list", timeout=10)
-                candidates = [p for p in agents.get("agents", [])
-                              if p.get("cwd") == firstmate.main_cwd(cfg)]
-                health = Resolution(reason="conversation_ambiguous" if not unavailable
-                                    and not pane_id and len(candidates) > 1 else "source_unavailable")
+                health = Resolution(reason=route.reason if not pane_id else "source_unavailable")
             else:
                 health = source_result(cfg, pane_id, info, info.get("agent_session") or {},
                                        info.get("cwd", ""))

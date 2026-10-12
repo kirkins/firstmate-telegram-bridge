@@ -313,6 +313,242 @@ class TestCodexBinding(unittest.TestCase):
         self.poll_updates()
         self.assertEqual(self.api.texts[-1], "A complete public update.")
 
+    def test_binding_lookup_outage_is_not_reclassified_by_a_second_probe(self):
+        binding = self.bind()
+        original = self.herdr.json
+        for reader in (codex_binding.binding_result, codex_binding.prepare_binding,
+                       codex_binding.completed_updates):
+            with self.subTest(reader=reader.__name__):
+                lookups = []
+
+                def interrupted(*args, timeout=30):
+                    if args[:2] == ("agent", "list"):
+                        lookups.append(args)
+                        if len(lookups) == 1:
+                            return {}, "temporary transport outage"
+                    return original(*args, timeout=timeout)
+
+                with patch.object(tg, "herdr_json", side_effect=interrupted):
+                    if reader is codex_binding.prepare_binding:
+                        with self.assertRaises(codex_binding.BindingError) as refused:
+                            reader(self.cfg, MAIN, self.pane)
+                        self.assertEqual(refused.exception.reason, "source_unavailable")
+                    else:
+                        result = reader(self.cfg, MAIN, self.pane)
+                        if reader is codex_binding.binding_result:
+                            self.assertEqual(result.state, "retrying")
+                            self.assertEqual(result.reason, "source_unavailable")
+                        else:
+                            self.assertIsNone(result)
+                self.assertEqual(len(lookups), 1)
+                self.assertEqual(tg.read_state(codex_binding.BINDING, {}), binding)
+        self.assertEqual(self.api.sent, [])
+
+    def test_watcher_route_outage_preserves_claims_and_resumes_without_rebinding(self):
+        self.begin_updates()
+        self.append_rows(*self.native_rows())
+        self.herdr.agents.append(agent(WORKER, self.home, cli="codex"))
+        binding = tg.read_state(codex_binding.BINDING, {})
+        cursor = tg.read_state(watch.CONTENT_LAST, {})
+        markers = tg.read_state(notify.CONTENT_SENT, {})
+        original = self.herdr.json
+        lookups = []
+
+        def interrupted(*args, timeout=30):
+            if args[:2] == ("agent", "list"):
+                lookups.append(args)
+                if len(lookups) == 2:
+                    return {}, "temporary transport outage"
+            return original(*args, timeout=timeout)
+
+        with patch.object(tg, "herdr_json", side_effect=interrupted):
+            self.poll_updates()
+        self.assertEqual(self.health()[0]["state"], "retrying")
+        self.assertEqual(self.health()[0]["reason"], "source_unavailable")
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {}), cursor)
+        self.assertEqual(tg.read_state(notify.CONTENT_SENT, {}), markers)
+        self.poll_updates()
+        self.assertEqual(self.api.texts, ["A complete public update."])
+        self.assertEqual(self.health(), [])
+        self.assertEqual(tg.read_state(codex_binding.BINDING, {}), binding)
+
+    def test_health_check_route_outage_does_not_override_claims_with_candidate_count(self):
+        self.bind()
+        self.herdr.agents.append(agent(WORKER, self.home, cli="codex"))
+        write_config(self.cfg)
+        original = self.herdr.json
+        lookups = []
+
+        def interrupted(*args, timeout=30):
+            if args[:2] == ("agent", "list"):
+                lookups.append(args)
+                if len(lookups) == 1:
+                    return {}, "temporary transport outage"
+            return original(*args, timeout=timeout)
+
+        output = io.StringIO()
+        with patch.object(tg, "herdr_json", side_effect=interrupted), \
+                patch.object(codex_binding.sys, "argv", ["codex_binding.py", "--check"]), \
+                redirect_stdout(output), self.assertRaises(SystemExit):
+            codex_binding.main()
+        self.assertIn("retrying; reason=source_unavailable", output.getvalue())
+        self.assertIn("no registration is needed", output.getvalue())
+        self.assertEqual(len(lookups), 1)
+        output = io.StringIO()
+        with patch.object(codex_binding.sys, "argv", ["codex_binding.py", "--check"]), \
+                redirect_stdout(output):
+            codex_binding.main()
+        self.assertIn("binding validated", output.getvalue())
+        self.assertEqual(self.api.sent, [])
+
+    def test_mixed_harness_route_ambiguity_notifies_once_per_foreground_lifetime(self):
+        competing = agent("wF:p1", self.home, cli="pi")
+        self.herdr.agents.append(competing)
+        self.process(201, 100, "21", name="pi")
+        original = self.herdr.json
+
+        def processes(*args, timeout=30):
+            if args[:2] == ("pane", "process-info") and args[3] == competing["pane_id"]:
+                return {"process_info": {"pane_id": args[3], "foreground_processes": [
+                    {"pid": 201, "name": "pi"}]}}, ""
+            return original(*args, timeout=timeout)
+
+        with patch.object(tg, "herdr_json", side_effect=processes):
+            self.poll_updates()
+            self.poll_updates()
+            self.assertEqual(self.health()[0]["reason"], "conversation_ambiguous")
+            self.assertEqual(len(self.api.sent), 1)
+            self.process(201, 100, "2100", name="pi")
+            self.poll_updates()
+            self.poll_updates()
+            self.assertEqual(len(self.api.sent), 2)
+        self.assertEqual(tg.read_state(codex_binding.BINDING, {}), {})
+        self.assertEqual(tg.read_state(notify.CONTENT_SENT, {}), {})
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {}), {})
+
+    def test_explicit_ambiguity_lifetime_outage_does_not_repeat_notice(self):
+        self.begin_updates()
+        self.append_rows(*self.native_rows())
+        binding = tg.read_state(codex_binding.BINDING, {})
+        markers = tg.read_state(notify.CONTENT_SENT, {})
+        cursor = tg.read_state(watch.CONTENT_LAST, {})
+        path = next(self.sessions.glob(f"*/*/*/*{CURRENT}.jsonl"))
+        duplicate = self.sessions / "2026/01/03" / path.name
+        duplicate.parent.mkdir()
+        duplicate.write_bytes(path.read_bytes())
+        self.pane["agent_session"] = {"kind": "id", "value": CURRENT}
+        self.poll_updates()
+        notices = self.health()[0]["notices"]
+        self.assertEqual(len(self.api.sent), 1)
+        original = self.herdr.json
+
+        def unavailable(*args, timeout=30):
+            if args[:2] == ("pane", "process-info"):
+                return {}, "temporary transport outage"
+            return original(*args, timeout=timeout)
+
+        with patch.object(tg, "herdr_json", side_effect=unavailable):
+            watch._NOTES.clear()
+            self.poll_updates(prime=True)
+            self.poll_updates()
+        self.assertEqual(self.health()[0]["notices"], notices)
+        self.assertEqual(self.health()[0]["reason"], "conversation_ambiguous")
+        self.assertEqual(len(self.api.sent), 1)
+        stat = self.proc / "200/stat"
+        saved = stat.with_suffix(".offline")
+        stat.rename(saved)
+        self.poll_updates()
+        saved.rename(stat)
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 1)
+        self.assertEqual(tg.read_state(notify.CONTENT_SENT, {}), markers)
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {}), cursor)
+        self.process(200, 100, "2000")
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 2)
+        duplicate.unlink()
+        self.poll_updates()
+        self.assertEqual(self.api.texts[-1], "A complete public update.")
+        self.assertEqual(self.health(), [])
+        self.assertEqual(tg.read_state(codex_binding.BINDING, {}), binding)
+
+    def test_unknown_lifetime_defers_notice_until_lookup_recovers(self):
+        self.pane["agent_session"] = {"kind": "id", "value": "*"}
+        original = self.herdr.json
+
+        def unavailable(*args, timeout=30):
+            if args[:2] == ("pane", "process-info"):
+                return {}, "temporary transport outage"
+            return original(*args, timeout=timeout)
+
+        with patch.object(tg, "herdr_json", side_effect=unavailable):
+            self.poll_updates()
+            self.poll_updates()
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(self.health()[0]["reason"], "conversation_ambiguous")
+        self.assertEqual(self.health()[0]["notices"], {})
+        self.poll_updates()
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_verified_empty_foreground_still_has_a_notice_identity(self):
+        self.pane["agent_session"] = {"kind": "id", "value": "*"}
+        original = self.herdr.json
+
+        def empty(*args, timeout=30):
+            if args[:2] == ("pane", "process-info"):
+                return {"process_info": {"pane_id": args[3], "foreground_processes": []}}, ""
+            return original(*args, timeout=timeout)
+
+        with patch.object(tg, "herdr_json", side_effect=empty):
+            self.poll_updates()
+            self.poll_updates()
+        self.assertEqual(self.health()[0]["lifetime"], [])
+        self.assertEqual(self.health()[0]["reason"], "conversation_ambiguous")
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_successful_explicit_reads_and_delivery_skip_process_info(self):
+        for kind in ("path", "id"):
+            with self.subTest(kind=kind):
+                reset_state()
+                self.api.sent.clear()
+                self.pane.pop("agent_session", None)
+                self.begin_updates()
+                path = self.rollout(NEXT, "Explicit reference")
+                self.append_rows(*self.native_rows(sid=NEXT), sid=NEXT)
+                self.pane["agent_session"] = {"kind": kind, "value": path if kind == "path" else NEXT}
+                binding = tg.read_state(codex_binding.BINDING, {})
+                write_config(self.cfg)
+                original = self.herdr.json
+                probes = []
+
+                def unavailable(*args, timeout=30):
+                    if args[:2] == ("pane", "process-info"):
+                        probes.append(args)
+                        return {}, "temporary transport outage"
+                    return original(*args, timeout=timeout)
+
+                with patch.object(tg, "herdr_json", side_effect=unavailable):
+                    identity, reply = self.identity()
+                    self.assertEqual(reply, "A complete public update.")
+                    updates = codex_binding.completed_updates(self.cfg, MAIN, self.pane)
+                    self.assertEqual([u.identity for u in updates], [identity])
+                    output = io.StringIO()
+                    with patch.object(codex_binding.sys, "argv", ["codex_binding.py", "--check"]), \
+                            redirect_stdout(output):
+                        codex_binding.main()
+                    self.assertIn("binding validated", output.getvalue())
+                    self.poll_updates()
+                    self.assertFalse(codex_binding.changed_during_settle(self.cfg, MAIN, identity, reply))
+                    self.assertFalse(self.deliver())
+                self.assertEqual(probes, [])
+                self.assertEqual(self.api.texts, ["A complete public update."])
+                self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], identity)
+                self.assertTrue(notify.content_already_sent(MAIN, identity))
+                self.assertEqual(self.health(), [])
+                self.assertEqual(tg.read_state(codex_binding.BINDING, {}), binding)
+
     def test_explicit_reference_recovers_stale_binding_and_unavailable_ref_never_falls_back(self):
         self.begin_updates()
         self.process(200, 100, "2000")
@@ -358,7 +594,7 @@ class TestCodexBinding(unittest.TestCase):
         self.herdr.agents.remove(competing)
         other = str(self.base / "another-home")
         cfg = {**self.cfg, "firstmate": {"enabled": True, "main_cwd": other}}
-        watch.source_health(cfg, {}, codex_binding.Resolution(reason="missing_binding"))
+        watch.source_health(cfg, {}, codex_binding.Resolution(reason="missing_binding", lifetime=()))
         self.assertEqual(len(self.api.sent), 2)
         self.bind()
         self.poll_updates()

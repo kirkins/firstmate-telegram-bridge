@@ -131,7 +131,8 @@ def source_health(cfg: dict, pane: dict, result: codex_binding.Resolution) -> No
         now = time.time()
         notices = {k: t for k, t in notices.items() if now - t < notify.CONTENT_SENT_SECS}
         identity = hashlib.sha256(repr((result.lifetime, result.reason)).encode()).hexdigest()
-        if result.state == "handoff_required" and identity not in notices:
+        if (result.state == "handoff_required" and result.lifetime is not None
+                and identity not in notices):
             text = ("⚠️ Manager replies are disconnected: " + {
                 "missing_binding": "the current session has not been registered.",
                 "primary_replaced": "the manager was replaced.",
@@ -152,7 +153,8 @@ def source_health(cfg: dict, pane: dict, result: codex_binding.Resolution) -> No
         if len(notices) > 32:
             notices = dict(sorted(notices.items(), key=lambda item: item[1])[-32:])
         current = {"home": home, "state": result.state, "reason": result.reason,
-                   "lifetime": [list(item) for item in result.lifetime],
+                   "lifetime": ([list(item) for item in result.lifetime]
+                                if result.lifetime is not None else None),
                    "notices": notices, "updated": now}
         health[scope] = current
         if len(health) > 500:
@@ -226,26 +228,27 @@ def poll_once(cfg: dict, prime: bool = False) -> None:
     _NOTES.pop(f"agentlist:{tg.STATE_DIR}", None)
     content = content_delivery(cfg)
     fm = firstmate.enabled(cfg)
-    main = firstmate.main_pane_id(cfg) if fm else None
+    route = firstmate.main_pane_result(cfg) if fm else None
+    main = (route.target["pane"] if route.target else "") if fm else None
     if fm:
         if not main:
             candidates = [p for p in result.get("agents", [])
                           if p.get("cwd") == firstmate.main_cwd(cfg)
-                          and p.get("agent") == "codex"]
-            if candidates:
-                lifetime = []
+                          and p.get("pane_id")]
+            lifetime = None
+            if route.reason == "conversation_ambiguous" and candidates:
                 try:
-                    _, unavailable = tg.herdr_json("agent", "list", timeout=10)
-                    if unavailable or len(candidates) == 1:
-                        raise codex_binding.BindingError("main route temporarily unavailable")
+                    observed = []
                     for candidate in sorted(candidates, key=lambda p: p["pane_id"]):
-                        for pid in sorted(codex_binding._foreground(candidate["pane_id"])):
-                            lifetime.append((candidate["pane_id"], pid, codex_binding._process(pid)[1]))
+                        processes = codex_binding._foreground(candidate["pane_id"], agent=None)
+                        if not processes:
+                            observed.append((candidate["pane_id"],))
+                        for pid in sorted(processes):
+                            observed.append((candidate["pane_id"], pid, codex_binding._process(pid)[1]))
+                    lifetime = tuple(observed)
                 except (codex_binding.BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
-                    source_health(cfg, {}, codex_binding.Resolution(reason="source_unavailable"))
-                else:
-                    source_health(cfg, {}, codex_binding.Resolution(
-                        reason="conversation_ambiguous", lifetime=tuple(lifetime)))
+                    pass
+            source_health(cfg, {}, codex_binding.Resolution(reason=route.reason, lifetime=lifetime))
         for pane in result.get("agents", []):
             if pane.get("pane_id") == main:
                 if pane.get("agent") == "codex":

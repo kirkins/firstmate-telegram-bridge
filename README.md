@@ -390,9 +390,11 @@ if the main pane can't be resolved, nothing relays (fail closed).
  kept. `/read` output is raw terminal by design and is never filtered.
 
 **Divergence policy:** every fork change is either a firstmate helper file, a
-new config section, or a guarded one-to-three-line hook in `bot.py`/`notify.py`
-of the form `if firstmate.enabled(cfg):`, with config passed through the shared
-watcher — plus two small upstream-safe fixes that
+new config section, a guarded one-to-three-line hook in `bot.py`/`notify.py`
+of the form `if firstmate.enabled(cfg):` (with config passed through the shared
+watcher), or a default-off top-level config key gating a small,
+individually-testable behavior change (e.g. the TTS pure-acknowledgement skip,
+`suppress_noop_ack`) — plus two small upstream-safe fixes that
 ship unconditionally (token redaction in Telegram API error strings, and
 quote-escaping of link URLs in the markdown renderer). Pulling from upstream should
 stay cheap; conflict resolution is confined to those anchor points.

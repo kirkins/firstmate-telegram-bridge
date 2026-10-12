@@ -218,8 +218,8 @@ everything that was already finished. The watcher rides the reply poller, so
 Nothing in the watcher drops silently: every status change a poll observes is one
 `bridge.log` line (pane, `prev -> new`, and herdr's `state_change_seq` when it reports
 one), and every refusal to push — priming, not-news, a message held while the pane
-works, an unsettle flap, a debounce, a filtered status or agent, a send failure —
-logs its reason. "The pane finished but the phone never rang" is always answerable
+works, an unsettle flap, a debounce, a filtered status or agent, a suppressed no-op
+acknowledgement, a send failure — logs its reason. "The pane finished but the phone never rang" is always answerable
 from the log.
 
 Sampling statuses can still miss a completion twice over:

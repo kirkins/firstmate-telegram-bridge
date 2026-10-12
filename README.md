@@ -107,6 +107,8 @@ Configure `[tts]` — like voice input, this runs on any OpenAI-compatible endpo
 
 **Pure acknowledgements stay text-only.** A message that is nothing but a trivial all-clear — “Captain, shipshape.” and its few trivially-equivalent forms (`tts.ACK_SHAPES`), matched whole-message only — is never spoken: a voice bubble for a nothing-happened signal is noise, so the skip is logged like the other refusals and the text bubble carries it. An acknowledgement embedded in a longer substantive message still speaks.
 
+**The no-op acknowledgement can be dropped entirely.** `suppress_noop_ack = true` stops even that text push when the message is nothing but the routine no-op acknowledgement (“Captain, shipshape.”, matched with the same semantics the voice skip uses): nothing reaches Telegram — no text, no voice, no notification — so the phone notifies only when something actually happened. Each drop is one `bridge.log` line; every other message delivers unchanged. `false` (the default) keeps the quiet text bubble.
+
 **An absent `[tts]` section or a bad key makes `/voice` report exactly why** instead of breaking replies; runtime failures log to bridge.log and warn the chat at most once an hour.
 
 A consolidated single voice note for several messages is under consideration.
@@ -163,6 +165,7 @@ Everything else has a working default. [`config.example.toml`](config.example.to
 
 - which `statuses` notify, an `agents` filter
 - `settle_ms`, `quiet_seconds`, `snippet_chars`
+- `suppress_noop_ack` to drop the routine “Captain, shipshape.” no-op acknowledgement from Telegram entirely (no text, no voice, no notification)
 - `markdown` / `fold` / `max_messages`
 - `replies` / `reply_to_latest` / `allowed_user_ids` / `read_lines`
 - `accept_files` / `inbox_days` / `max_file_mb`
@@ -215,8 +218,8 @@ everything that was already finished. The watcher rides the reply poller, so
 Nothing in the watcher drops silently: every status change a poll observes is one
 `bridge.log` line (pane, `prev -> new`, and herdr's `state_change_seq` when it reports
 one), and every refusal to push — priming, not-news, a message held while the pane
-works, an unsettle flap, a debounce, a filtered status or agent, a send failure —
-logs its reason. "The pane finished but the phone never rang" is always answerable
+works, an unsettle flap, a debounce, a filtered status or agent, a suppressed no-op
+acknowledgement, a send failure — logs its reason. "The pane finished but the phone never rang" is always answerable
 from the log.
 
 Sampling statuses can still miss a completion twice over:
@@ -387,9 +390,11 @@ if the main pane can't be resolved, nothing relays (fail closed).
  kept. `/read` output is raw terminal by design and is never filtered.
 
 **Divergence policy:** every fork change is either a firstmate helper file, a
-new config section, or a guarded one-to-three-line hook in `bot.py`/`notify.py`
-of the form `if firstmate.enabled(cfg):`, with config passed through the shared
-watcher — plus two small upstream-safe fixes that
+new config section, a guarded one-to-three-line hook in `bot.py`/`notify.py`
+of the form `if firstmate.enabled(cfg):` (with config passed through the shared
+watcher), or a default-off top-level config key gating a small,
+individually-testable behavior change (e.g. the TTS pure-acknowledgement skip,
+`suppress_noop_ack`) — plus two small upstream-safe fixes that
 ship unconditionally (token redaction in Telegram API error strings, and
 quote-escaping of link URLs in the markdown renderer). Pulling from upstream should
 stay cheap; conflict resolution is confined to those anchor points.

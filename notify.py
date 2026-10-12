@@ -597,6 +597,16 @@ def fold_mode(cfg: dict) -> str:
     return "never" if firstmate.enabled(cfg) else "auto"
 
 
+def suppress_noop_ack(cfg: dict) -> bool:
+    """Top-level suppress_noop_ack: true drops the routine no-op acknowledgement
+    ("Captain, shipshape.", matched by tts.is_noop_acknowledgement under the
+    voice-skip semantics) from Telegram delivery entirely — no text, no voice,
+    no notification — so the phone notifies only when something actually
+    happened. Default false: the ack keeps arriving as its quiet text bubble
+    (never spoken), and every other message delivers unchanged either way."""
+    return bool(cfg.get("suppress_noop_ack", False))
+
+
 def send_message(cfg: dict, text: str, plain: str | None = None, target: dict | None = None) -> bool:
     """Send one message; True when Telegram took it. `plain` enables HTML rendering
     with itself as the fallback, so a bug in the markdown renderer degrades to
@@ -852,10 +862,9 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
     """The one send path for pane and sealed-message notifications, shared by the event
     hook (main below), the poll-based status diff (watch.py), the content
     pass and the mid-run relay (also watch.py): classification, the statuses/agents
-    filters, the firstmate posture, the cross-process delivery lock, the sent-marker
-    dedupe, the settle re-check, the quiet debounce and the reply-map target all live
-    here so the paths cannot drift
-    apart. `prev` is the pane's previous status from last_status.json — the
+    filters, the firstmate posture, the suppress_noop_ack gate, the cross-process
+    delivery lock, the sent-marker dedupe, the settle re-check, the quiet debounce
+    and the reply-map target all live here so the paths cannot drift apart. `prev` is the pane's previous status from last_status.json — the
     caller has already swapped it in. origin="content" skips the settle
     re-check (the pane not working at observation time is that push's flap
     guard) and trusts the caller's content_id. origin="midrun" additionally
@@ -913,6 +922,22 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
             and codex_binding.delivery_denied(pane_id, status, identity, reply, content_id)):
         return False
     content_id = content_id or identity  # the content pass already resolved it
+    # The routine no-op acknowledgement is a handled-wake confirmation, not
+    # news: with suppress_noop_ack the whole push is dropped — no text, no
+    # voice, no notification. The sent-marker is stamped so every other path
+    # (the watcher's content and mid-run passes) treats the message as handled
+    # instead of retrying it on every poll; the drop is logged so operators can
+    # verify it fired. Anything else — extra text around the string, any other
+    # message — is untouched here and delivers below.
+    if suppress_noop_ack(cfg) and tts.is_noop_acknowledgement(reply):
+        if content_id:
+            mark_content_sent(pane_id, content_id)
+            tg.log(f"skip pane={pane_id}: no-op acknowledgement suppressed, not sent "
+                   f"(suppress_noop_ack) ({content_id[:24]})")
+        else:
+            tg.log(f"skip pane={pane_id}: no-op acknowledgement suppressed, not sent "
+                   f"(suppress_noop_ack)")
+        return False
     # The cross-process delivery lock (see DELIVER_LOCKS above): taken before
     # the marker read it guards, held through the stamp and the speech after
     # it (only a same-identity delivery ever waits on it), so exactly one

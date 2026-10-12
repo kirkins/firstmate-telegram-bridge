@@ -647,6 +647,17 @@ class TestMaybeSpeak(TtsCase):
         self.assertEqual(self.voice.calls, [])          # but no voice note
         self.assertEqual(self.runner.argvs, [])         # nothing synthesized
 
+    def test_suppressed_noop_ack_sends_no_text_and_no_voice(self):
+        # suppress_noop_ack goes further than the voice skip: nothing at all
+        # reaches Telegram — no text bubble, no voice note, no synthesis
+        tts.set_voice_mode(True)
+        self.cfg["suppress_noop_ack"] = True
+        self.assertFalse(self.deliver(reply="Captain, shipshape."))
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(self.voice.calls, [])
+        self.assertEqual(self.runner.argvs, [])
+        self.assertTrue(notify.content_already_sent(MAIN, "m1"))
+
     def test_substantive_reply_still_speaks(self):
         tts.set_voice_mode(True)
         self.deliver(reply="Captain, shipshape. Two tests fail; fixing now.")
@@ -722,6 +733,48 @@ class TestMaybeSpeak(TtsCase):
         self.assertEqual(len(self.runner.bodies), 1)     # fits one request
         self.assertLessEqual(len(self.runner.bodies[0]["input"]), 120)
         self.assertTrue(self.runner.bodies[0]["input"].endswith("."))
+
+
+class TestNoopAckMatch(unittest.TestCase):
+    """tts.is_noop_acknowledgement — the matcher behind notify.deliver's
+    suppress_noop_ack gate: the exact no-op acknowledgement string under the
+    same semantics the voice skip uses (whitespace-collapsed, case-insensitive,
+    final full stop optional, whole-message only). Everything else — extra
+    text, an acknowledgement embedded in a substantive reply, the other
+    trivial all-clears — does not match, because the gate drops that one
+    message class and no other."""
+
+    def test_the_exact_string_matches(self):
+        self.assertTrue(tts.is_noop_acknowledgement("Captain, shipshape."))
+
+    def test_final_period_optional_and_case_folded(self):
+        self.assertTrue(tts.is_noop_acknowledgement("Captain, shipshape"))
+        self.assertTrue(tts.is_noop_acknowledgement("captain, shipshape."))
+        self.assertTrue(tts.is_noop_acknowledgement("CAPTAIN, SHIPSHAPE."))
+
+    def test_surrounding_whitespace_still_matches(self):
+        self.assertTrue(tts.is_noop_acknowledgement("  Captain, shipshape.  "))
+        self.assertTrue(tts.is_noop_acknowledgement("\n\n Captain, shipshape. \t\n"))
+
+    def test_extra_text_does_not_match(self):
+        self.assertFalse(tts.is_noop_acknowledgement(
+            "Captain, shipshape. Two tests fail; fixing now."))
+
+    def test_embedded_acknowledgement_does_not_match(self):
+        self.assertFalse(tts.is_noop_acknowledgement(
+            "All clear — Captain, shipshape."))
+
+    def test_other_ack_shapes_do_not_match(self):
+        # still pure acknowledgements for the voice skip, but not the no-op
+        # string suppress_noop_ack drops
+        for shape in ("Shipshape, captain.", "All clear, captain",
+                      "Captain, all clear."):
+            self.assertTrue(tts.is_pure_acknowledgement(shape))
+            self.assertFalse(tts.is_noop_acknowledgement(shape))
+
+    def test_empty_and_blank_never_match(self):
+        self.assertFalse(tts.is_noop_acknowledgement(""))
+        self.assertFalse(tts.is_noop_acknowledgement("   \n  "))
 
 
 class TestSendVoice(unittest.TestCase):

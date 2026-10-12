@@ -24,7 +24,10 @@ SESSIONS = os.path.join(os.path.expanduser("~"), ".codex", "sessions")
 PROC = "/proc"
 MANAGED_RELEASES = os.path.join(os.path.expanduser("~"), ".codex", "packages",
                                "app-server-daemon", "releases")
+MISE_CODEX_INSTALLS = os.path.join(os.path.expanduser("~"), ".local", "share", "mise",
+                                  "installs", "codex")
 SESSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+MISE_CODEX_VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*")
 
 
 class BindingError(ValueError):
@@ -63,14 +66,27 @@ def _ancestor() -> tuple[int, str]:
     raise BindingError("run binding inside a tool shell of the primary Codex conversation")
 
 
+def _managed_executable(executable: str) -> bool:
+    """Accept only direct release binaries from the two supported install roots."""
+    roots = ((os.path.realpath(MANAGED_RELEASES), None),
+             (os.path.realpath(MISE_CODEX_INSTALLS), MISE_CODEX_VERSION))
+    for root, version_pattern in roots:
+        try:
+            parts = os.path.relpath(executable, root).split(os.sep)
+        except ValueError:
+            continue
+        if (len(parts) == 3 and parts[0] not in ("", ".", "..")
+                and parts[1:] == ["bin", "codex"]
+                and (version_pattern is None or version_pattern.fullmatch(parts[0]))):
+            return True
+    return False
+
+
 def _managed(pid: int, ticks: str) -> None:
-    """Validate the installed managed Codex executable, mode, owner and lifetime."""
+    """Validate an installed managed Codex executable, mode, owner and lifetime."""
     directory = os.path.join(PROC, str(pid))
     executable = os.readlink(os.path.join(directory, "exe"))
-    relative = os.path.relpath(executable, os.path.realpath(MANAGED_RELEASES))
-    parts = relative.split(os.sep)
-    if (len(parts) != 3 or parts[0] in ("", ".", "..")
-            or parts[1:] != ["bin", "codex"]
+    if (not _managed_executable(executable)
             or os.path.realpath(executable) != executable
             or not os.path.isfile(executable) or not os.access(executable, os.X_OK)
             or not os.path.samestat(os.stat(os.path.join(directory, "exe")),
@@ -339,8 +355,9 @@ def changed_during_settle(cfg: dict, pane_id: str, identity: str, reply: str) ->
     return False
 
 
-def bind(cfg: dict, pane_id: str, info: dict, primary_session: str | None = None) -> dict:
-    """Bind from the pane, or from managed Codex with an owner-supplied exact id."""
+def prepare_binding(cfg: dict, pane_id: str, info: dict,
+                    primary_session: str | None = None) -> dict:
+    """Validate a binding candidate without changing persisted state."""
     cwd = _main(cfg, pane_id, info)
     session_id = os.environ.get("CODEX_THREAD_ID", "")
     if primary_session is not None and (not SESSION_ID.fullmatch(primary_session)
@@ -373,6 +390,12 @@ def bind(cfg: dict, pane_id: str, info: dict, primary_session: str | None = None
                "other_rollouts": others, "opaque_rollouts": opaque}
     if managed:
         binding.update(managed_pid=caller, managed_start_ticks=caller_ticks)
+    return binding
+
+
+def bind(cfg: dict, pane_id: str, info: dict, primary_session: str | None = None) -> dict:
+    """Persist a validated pane binding or managed caller's owner-verified candidate."""
+    binding = prepare_binding(cfg, pane_id, info, primary_session)
     tg.write_state(BINDING, binding)
     return binding
 

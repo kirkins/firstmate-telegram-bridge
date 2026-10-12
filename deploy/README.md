@@ -83,18 +83,22 @@ native UUID explicitly:
 HERDR_PLUGIN_CONFIG_DIR=~/.config/herdr-telegram-bridge \
   HERDR_PLUGIN_STATE_DIR=~/.local/state/herdr-telegram-bridge \
   python3 ~/.local/share/herdr-telegram-bridge/codex_binding.py \
-    --primary-session OWNER_VERIFIED_CURRENT_PRIMARY_UUID
+    --primary-session "$CODEX_THREAD_ID"
 ```
 
-Replace the placeholder with the verified UUID. This reference is an owner
-assertion: obtain it from the primary conversation's
-native tool context, with independently established primary provenance. Do not
-let a worker choose the reference or substitute its own UUID. The command
-requires equality with the caller's native thread, the nearest Codex ancestor's
-installed `~/.codex/packages/app-server-daemon/releases/*/bin/codex` executable,
-`app-server` mode, user ownership and unchanged process lifetime. It also requires
-one live foreground Codex process for the resolved main pane. A renamed process,
-ordinary shell, nearer worker Codex, or mismatched worker/old thread is refused.
+Run this only in a tool shell from the current primary conversation, where
+`CODEX_THREAD_ID` is supplied by that native context. Do not copy a worker's
+UUID or let a worker choose the reference. The helper checks that the supplied
+value equals its native caller thread, then validates the caller and target
+processes plus the exact rollout metadata; the value alone grants no authority.
+The command requires equality with the caller's native thread, the nearest Codex
+ancestor's installed app-server executable, `app-server` mode, user ownership
+and unchanged process lifetime. Supported executable locations are
+`~/.codex/packages/app-server-daemon/releases/<release>/bin/codex` and
+`~/.local/share/mise/installs/codex/<version>/bin/codex`, where the mise version
+directory is a direct semantic-version release. It also requires one live
+foreground Codex process for the resolved main pane. A renamed process, ordinary
+shell, nearer worker Codex, or mismatched worker/old thread is refused.
 
 Both paths check the exact rollout's native id/cwd metadata and recheck process
 lifetimes after scanning before atomically writing `codex_main.json` in the

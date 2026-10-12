@@ -47,6 +47,7 @@ class TestCodexBinding(unittest.TestCase):
         self.sessions = self.base / ".codex" / "sessions"
         self.proc = self.base / "proc"
         self.releases = self.base / ".codex/packages/app-server-daemon/releases"
+        self.mise_installs = self.base / ".local/share/mise/installs/codex"
         for pid, parent, ticks in [(300, 200, "30"), (200, 100, "20"), (100, 1, "10")]:
             self.process(pid, parent, ticks)
         self.pane = agent(MAIN, self.home, cli="codex", title="Old session banner", status="idle")
@@ -58,6 +59,7 @@ class TestCodexBinding(unittest.TestCase):
         for target, name, value in [(codex_binding, "SESSIONS", str(self.sessions)),
                                     (codex_binding, "PROC", str(self.proc)),
                                     (codex_binding, "MANAGED_RELEASES", str(self.releases)),
+                                    (codex_binding, "MISE_CODEX_INSTALLS", str(self.mise_installs)),
                                     (tg, "herdr_json", self.herdr.json),
                                     (tg, "herdr_run", self.herdr.run), (tg, "api", self.api)]:
             p = patch.object(target, name, value)
@@ -121,6 +123,18 @@ class TestCodexBinding(unittest.TestCase):
                 (self.proc / str(pid) / "exe").symlink_to(executable)
                 (self.proc / str(pid) / "cmdline").write_bytes(
                     os.fsencode(executable) + b"\0app-server\0")
+
+    def mise_chain(self):
+        """The deployed mise layout, with the same managed app-server topology."""
+        self.managed_chain()
+        executable = self.mise_installs / "0.162.1/bin/codex"
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_text("synthetic mise Codex fixture\n")
+        executable.chmod(0o700)
+        for pid in (400, 450):
+            path = self.proc / str(pid) / "exe"
+            path.unlink()
+            path.symlink_to(executable)
 
     def bind_managed(self, sid=CURRENT, primary=CURRENT):
         with patch.dict(os.environ, {"CODEX_THREAD_ID": sid}), \
@@ -729,6 +743,50 @@ class TestCodexBinding(unittest.TestCase):
         self.clock += 20
         self.assertFalse(self.deliver())
         self.assertEqual(self.api.texts, [ANSWER])
+
+    def test_mise_managed_cli_prepares_without_writing_then_delivers_once(self):
+        self.mise_chain()
+        self.rollout(OTHER, "Same-cwd worker answer")
+        write_config(self.cfg)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": CURRENT}), \
+                patch.object(codex_binding.os, "getpid", return_value=300), \
+                patch.object(tg, "resolve_token", side_effect=AssertionError("credential lookup")), \
+                redirect_stdout(io.StringIO()):
+            candidate = codex_binding.prepare_binding(self.cfg, MAIN, self.pane, CURRENT)
+            self.assertEqual((candidate["managed_pid"], candidate["managed_start_ticks"]),
+                             (400, "400"))
+            self.assertEqual(candidate["session_id"], CURRENT)
+            self.assertEqual(tg.read_state(codex_binding.BINDING, {}), {})
+            with patch.object(codex_binding.sys, "argv",
+                              ["codex_binding.py", "--primary-session", CURRENT]):
+                codex_binding.main()
+        binding = tg.read_state(codex_binding.BINDING, {})
+        self.assertEqual((binding["pid"], binding["start_ticks"]), (200, "20"))
+        self.assertEqual((binding["managed_pid"], binding["managed_start_ticks"]), (400, "400"))
+        self.assertEqual(binding["session_id"], CURRENT)
+        tg.write_state("last_status.json", {MAIN: "working"})
+        watch.poll_once(self.cfg)
+        watch.content_pass(self.cfg, self.pane, main=MAIN)
+        self.clock += 20
+        self.assertFalse(self.deliver())
+        self.assertEqual(self.api.texts, [ANSWER])
+
+    def test_mise_managed_cli_still_requires_exact_owner_and_app_server_mode(self):
+        self.mise_chain()
+        self.rollout(OTHER, "Worker text")
+        self.rollout(NEXT, "Old primary text")
+        for native, primary in [(OTHER, CURRENT), (NEXT, CURRENT), (CURRENT, NEXT),
+                                (CURRENT, ""), (CURRENT, "../../guess")]:
+            with self.subTest(native=native, primary=primary), \
+                    self.assertRaises(codex_binding.BindingError):
+                self.bind_managed(native, primary)
+        self.assertEqual(tg.read_state(codex_binding.BINDING, {}), {})
+
+        cmdline = self.proc / "400/cmdline"
+        cmdline.write_bytes(b"codex\0exec\0")
+        with self.assertRaises(codex_binding.BindingError):
+            self.bind_managed()
+        self.assertEqual(tg.read_state(codex_binding.BINDING, {}), {})
 
     def test_managed_without_owner_reference_reproduces_operator_refusal(self):
         self.managed_chain()

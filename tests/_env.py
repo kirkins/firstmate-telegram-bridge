@@ -36,7 +36,7 @@ USER = 1
 STATE_FILES = ("msg_targets.json", "current_target.json", "last_status.json",
                "last_sent.json", "bot_offset.json", "content_sent.json",
                "content_last.json", "codex_main.json", "voice_mode.json",
-               "tts_warn.json")
+               "tts_warn.json", "bridge_health.json")
 
 REAL_HERDR_RUN = tg.herdr_run
 REAL_HERDR_JSON = tg.herdr_json

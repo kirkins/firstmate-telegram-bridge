@@ -31,7 +31,27 @@ MISE_CODEX_VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*")
 
 
 class BindingError(ValueError):
-    pass
+    def __init__(self, message: str, reason: str = "source_unavailable"):
+        super().__init__(message)
+        self.reason = reason
+
+
+class Resolution(NamedTuple):
+    path: str = ""
+    reason: str = ""
+    lifetime: tuple = ()
+
+    @property
+    def state(self) -> str:
+        if self.path:
+            return "ok"
+        return "retrying" if self.reason == "source_unavailable" else "handoff_required"
+
+
+RECOVERY = ("The current manager must register its verified session using the "
+            "owner-registration workflow (codex_binding.py in its own native tool shell; "
+            "managed Codex also needs --primary-session). Replies resume automatically "
+            "after registration; no bridge restart is needed.")
 
 
 def _process(pid: int) -> tuple[int, str]:
@@ -47,7 +67,7 @@ def _foreground(pane_id: str) -> list[int]:
         raise BindingError("pane process-info unavailable")
     info = result.get("process_info", {})
     if info.get("pane_id") != pane_id:
-        raise BindingError("process-info pane mismatch")
+        raise BindingError("process-info pane mismatch", "primary_replaced")
     return [p["pid"] for p in info.get("foreground_processes", [])
             if p.get("name") == "codex" and type(p.get("pid")) is int]
 
@@ -92,13 +112,13 @@ def _managed(pid: int, ticks: str) -> None:
             or not os.path.samestat(os.stat(os.path.join(directory, "exe")),
                                    os.stat(executable))
             or os.stat(directory).st_uid != os.getuid()):
-        raise BindingError("caller is not the installed managed Codex app-server")
+        raise BindingError("caller is not the installed managed Codex app-server", "primary_replaced")
     with open(os.path.join(directory, "cmdline"), "rb") as f:
         args = f.read(65536).split(b"\0")
     if len(args) < 2 or args[1] != b"app-server":
-        raise BindingError("managed Codex caller is not in app-server mode")
+        raise BindingError("managed Codex caller is not in app-server mode", "primary_replaced")
     if _process(pid)[1] != ticks:
-        raise BindingError("managed Codex process lifetime changed")
+        raise BindingError("managed Codex process lifetime changed", "process_lifetime_changed")
 
 
 def _metadata(path: str) -> dict:
@@ -112,16 +132,18 @@ def _metadata(path: str) -> dict:
 
 def _exact(session_id: str, cwd: str) -> str:
     if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
-        raise BindingError("invalid native session id")
+        raise BindingError("invalid native session id", "missing_binding")
     hits = glob.glob(os.path.join(SESSIONS, "*", "*", "*", f"rollout-*-{session_id}.jsonl"))
+    if not hits:
+        raise BindingError("exact rollout missing")
     if len(hits) != 1:
-        raise BindingError("exact rollout missing or ambiguous")
+        raise BindingError("exact rollout ambiguous", "conversation_ambiguous")
     try:
         meta = _metadata(hits[0])
     except (OSError, ValueError) as e:
         raise BindingError(f"bound rollout unreadable: {hits[0]}: {e}") from None
     if meta.get("id") != session_id or meta.get("cwd") != cwd:
-        raise BindingError("rollout session id/cwd mismatch")
+        raise BindingError("rollout session id/cwd mismatch", "conversation_ambiguous")
     return hits[0]
 
 
@@ -165,54 +187,112 @@ def _changed(current: tuple[dict, dict], snapshot: tuple) -> str:
 
 def _main(cfg: dict, pane_id: str, info: dict) -> str:
     cwd = firstmate.main_cwd(cfg)
-    if (not firstmate.enabled(cfg) or pane_id != firstmate.main_pane_id(cfg)
-            or info.get("agent") != "codex" or info.get("cwd") != cwd
+    if (not firstmate.enabled(cfg) or info.get("agent") != "codex" or info.get("cwd") != cwd
             or (info.get("foreground_cwd") or cwd) != cwd):
-        raise BindingError("pane is not the primary Codex pane")
+        raise BindingError("pane is not the primary Codex pane", "primary_replaced")
+    main = firstmate.main_pane_id(cfg)
+    if pane_id != main:
+        _, err = tg.herdr_json("agent", "list", timeout=10)
+        if err:
+            raise BindingError("primary source unavailable")
+        raise BindingError("pane is not the primary Codex pane",
+                           "primary_replaced" if main else "conversation_ambiguous")
     return cwd
 
 
-def resolve(cfg: dict, pane_id: str, info: dict) -> str:
-    """Validated exact rollout, or empty with a reason logged. Never guesses."""
+def binding_result(cfg: dict, pane_id: str, info: dict) -> Resolution:
+    """Classify a read without changing the binding or choosing a replacement."""
+    lifetime = ()
     try:
         cwd = _main(cfg, pane_id, info)
+        foreground = _foreground(pane_id)
+        lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(foreground))
         binding = tg.read_state(BINDING, {})
         if (not isinstance(binding, dict) or binding.get("version") != 1
-                or binding.get("pane_id") != pane_id or binding.get("cwd") != cwd):
-            raise BindingError("main session binding missing or mismatched; bind from its native tool shell")
+                or binding.get("cwd") != cwd):
+            raise BindingError("main session binding missing or mismatched; bind from its native tool shell",
+                               "missing_binding")
+        if binding.get("pane_id") != pane_id:
+            raise BindingError("bound primary pane replaced", "primary_replaced")
         pid = binding.get("pid")
-        if type(pid) is not int or pid not in _foreground(pane_id):
-            raise BindingError("bound Codex process replaced; rebind the current session")
+        if type(pid) is not int or pid not in foreground:
+            raise BindingError("bound Codex process replaced; rebind the current session", "primary_replaced")
         if _process(pid)[1] != binding.get("start_ticks"):
-            raise BindingError("bound Codex process lifetime changed; rebind the current session")
+            raise BindingError("bound Codex process lifetime changed; rebind the current session",
+                               "process_lifetime_changed")
         if "managed_pid" in binding:
             managed_pid = binding["managed_pid"]
             if type(managed_pid) is not int or managed_pid <= 1:
-                raise BindingError("invalid managed Codex process binding")
+                raise BindingError("invalid managed Codex process binding", "missing_binding")
+            lifetime += ((managed_pid, _process(managed_pid)[1]),)
             _managed(managed_pid, binding.get("managed_start_ticks"))
         path = _exact(binding.get("session_id"), cwd)
         current = _others(path, cwd)
         snapshot = (binding.get("other_rollouts"), binding.get("opaque_rollouts"))
         if current != snapshot:
             raise BindingError(f"competing same-cwd rollout changed ({_changed(current, snapshot)});"
-                               " rebind the current session")
-        return path
-    except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError) as e:
-        tg.log(f"codex binding: pane={pane_id}: {e}")
-        return ""
+                               " rebind the current session", "conversation_ambiguous")
+        return Resolution(path, lifetime=lifetime)
+    except FileNotFoundError:
+        return Resolution(reason="primary_replaced", lifetime=lifetime)
+    except BindingError as e:
+        return Resolution(reason=e.reason, lifetime=lifetime)
+    except (OSError, ValueError, IndexError, KeyError, TypeError):
+        return Resolution(reason="source_unavailable", lifetime=lifetime)
+
+
+def _diagnostic(cfg: dict, pane_id: str, result: Resolution) -> None:
+    # Share the watcher's standing-condition memo with status/event reads too.
+    import watch
+
+    key = f"codexhealth:{tg.STATE_DIR}:{firstmate.main_cwd(cfg)}:{pane_id}"
+    if result.path:
+        watch._NOTES.pop(key, None)
+    else:
+        watch._note(key, repr((result.reason, result.lifetime)),
+                    f"codex binding: pane={pane_id} {result.state} reason={result.reason}"
+                    + (f"; {RECOVERY}" if result.state == "handoff_required" else "; retrying next poll"))
+
+
+def resolve(cfg: dict, pane_id: str, info: dict) -> str:
+    """Validated exact rollout, or empty with a bounded, credential-free reason."""
+    result = binding_result(cfg, pane_id, info)
+    _diagnostic(cfg, pane_id, result)
+    return result.path
+
+
+def source_result(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) -> Resolution:
+    """An explicit exact reference takes priority, including when unavailable."""
+    if not session.get("value"):
+        return binding_result(cfg, pane_id, info)
+    lifetime = ()
+    try:
+        lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(_foreground(pane_id)))
+    except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+        pass  # An explicit reference retains its existing process-independent priority.
+    try:
+        if session.get("kind") == "path":
+            path = session["value"] if os.path.isfile(session["value"]) else ""
+        elif session.get("kind") == "id":
+            path = _exact(session["value"], cwd)
+        else:
+            path = ""
+        if path:
+            with open(path, "rb") as stream:
+                stream.read(1)
+        return Resolution(path, "" if path else "source_unavailable", lifetime)
+    except BindingError as e:
+        reason = "conversation_ambiguous" if e.reason == "missing_binding" else e.reason
+        return Resolution(reason=reason, lifetime=lifetime)
+    except (OSError, ValueError, TypeError):
+        return Resolution(reason="source_unavailable", lifetime=lifetime)
 
 
 def session_path(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) -> str:
     """Explicit refs win; an omitted ref uses the validated binding."""
-    import notify
-
-    if not session.get("value"):
-        path = resolve(cfg, pane_id, info)
-    elif session.get("kind") == "path" and not os.path.isfile(session["value"]):
-        path = ""
-    else:
-        path = notify.session_file("codex", session, cwd)
-    return path
+    result = source_result(cfg, pane_id, info, session, cwd)
+    _diagnostic(cfg, pane_id, result)
+    return result.path
 
 
 def read_reply(cfg: dict, pane_id: str, info: dict, session: dict, cwd: str) -> tuple[str, str]:
@@ -256,14 +336,15 @@ def completed_updates(cfg: dict, pane_id: str, info: dict) -> list[CompletedUpda
     an empty list means a validated native source has no complete pairs yet.
     """
     import notify
+    import watch
+
+    note = f"codexread:{tg.STATE_DIR}:{firstmate.main_cwd(cfg)}:{pane_id}"
 
     try:
         cwd = _main(cfg, pane_id, info)
         reference = info.get("agent_session") or {}
         # An id is exact authority, not a glob pattern or a newest-file choice.
-        path = (_exact(reference["value"], cwd)
-                if reference.get("kind") == "id" and reference.get("value")
-                else session_path(cfg, pane_id, info, reference, cwd))
+        path = session_path(cfg, pane_id, info, reference, cwd)
         if not path:
             return None
         meta = _metadata(path)
@@ -322,9 +403,10 @@ def completed_updates(cfg: dict, pane_id: str, info: dict) -> list[CompletedUpda
                 ambiguous.add(mid)
             seen[mid] = candidate
             updates[mid] = candidate
+        watch._NOTES.pop(note, None)
         return [candidate for mid, candidate in updates.items() if mid not in ambiguous]
-    except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError) as e:
-        tg.log(f"codex completed update: pane={pane_id}: source unavailable ({e})")
+    except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+        watch._note(note, "unavailable", f"codex completed update: pane={pane_id}: source unavailable; retrying")
         return None
 
 
@@ -407,11 +489,25 @@ def main() -> None:
             cfg = tomllib.load(f)
         pane_id = firstmate.main_pane_id(cfg)
         result, err = tg.herdr_json("agent", "get", pane_id, timeout=10)
-        if err:
+        checking = sys.argv[1:] == ["--check"]
+        if err and not checking:
             raise BindingError("primary pane unavailable")
-        if sys.argv[1:] == ["--check"]:
-            if not resolve(cfg, pane_id, result.get("agent", {})):
-                raise BindingError("binding invalid; see bridge.log")
+        if checking:
+            info = result.get("agent", {})
+            if err or not pane_id:
+                agents, unavailable = tg.herdr_json("agent", "list", timeout=10)
+                candidates = [p for p in agents.get("agents", [])
+                              if p.get("cwd") == firstmate.main_cwd(cfg)]
+                health = Resolution(reason="conversation_ambiguous" if not unavailable
+                                    and not pane_id and len(candidates) > 1 else "source_unavailable")
+            else:
+                health = source_result(cfg, pane_id, info, info.get("agent_session") or {},
+                                       info.get("cwd", ""))
+            if not health.path:
+                print(f"Codex reply health: {health.state}; reason={health.reason}")
+                print(RECOVERY if health.state == "handoff_required" else
+                      "The bridge will retry this source automatically; no registration is needed.")
+                raise SystemExit(1)
         elif not sys.argv[1:]:
             bind(cfg, pane_id, result.get("agent", {}))
         elif len(sys.argv) == 3 and sys.argv[1] == "--primary-session":

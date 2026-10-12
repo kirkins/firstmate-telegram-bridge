@@ -219,6 +219,8 @@ def main_pane_result(cfg: dict) -> MainPaneResult:
     unclaimed = [a for a in cands if not claims_pane(cfg, a["pane_id"])]
     if len(unclaimed) == 1:
         return MainPaneResult(_target_from(unclaimed[0]), "")
+    if pin and any(a.get("pane_id") == pin for a in result.get("agents", [])):
+        return MainPaneResult()
     tg.log(f"firstmate: {len(cands)} panes match main_cwd={want} and none is "
            f"unambiguously the main pane — failing closed")
     return MainPaneResult(reason="conversation_ambiguous")

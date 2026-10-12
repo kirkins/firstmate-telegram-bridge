@@ -126,6 +126,12 @@ service restart. If a Codex completion has no displayable reply, firstmate mode
 logs it rather than sending a title banner; an unresolved binding needs repair
 before actual replies can arrive.
 
+If a native delivery cursor is absent from the bounded rollout tail and has no
+native timestamp, the watcher checks the shared content-sent marker and drains
+only unmarked, sealed public completions in transcript order, at most eight per
+poll. It advances after each successful delivery, so a failed send and newer
+completions remain ordered for retry rather than being primed away.
+
 After an authorized code installation, verify through a normal reply in the
 primary conversation: its actual final text should arrive once, without the old
 session title, and a later poll/completion should not repeat it. Check

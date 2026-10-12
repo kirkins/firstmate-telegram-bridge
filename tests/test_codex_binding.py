@@ -204,6 +204,83 @@ class TestCodexBinding(unittest.TestCase):
         self.assertFalse(self.deliver())
         self.assertEqual(len(self.api.sent), 3)
 
+    def test_unlocatable_legacy_boundary_drains_native_backlog_by_sent_marker(self):
+        self.bind()
+        for n in range(1, 15):
+            self.append_rows(*self.native_rows(
+                f"legacy-recovery-{n}", f"Native public update {n}.", "commentary",
+                f"2026-01-02T00:{n:02d}:00Z"))
+        updates = codex_binding.completed_updates(self.cfg, MAIN, self.pane)
+        self.assertEqual(len(updates), 14)
+
+        # This mirrors the deployed cursor: an opaque legacy identity is both
+        # content_last and the latest sent-marker, with no native timestamp.
+        legacy_boundary = "legacy-final-without-native-time"
+        notify.mark_content_sent(MAIN, legacy_boundary)
+        tg.write_state(watch.CONTENT_LAST, {MAIN: legacy_boundary})
+        self.assertEqual(notify.last_delivered(MAIN), legacy_boundary)
+
+        self.poll_updates()
+        self.assertEqual(self.api.texts,
+                         [f"Native public update {n}." for n in range(1, 9)])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], updates[7].identity)
+        self.assertIn("deduping by sent-marker", self.log_text())
+
+        self.poll_updates()
+        self.assertEqual(self.api.texts,
+                         [f"Native public update {n}." for n in range(1, 15)])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], updates[-1].identity)
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 14)
+        self.assertTrue(all(notify.content_already_sent(MAIN, update.identity)
+                            for update in updates))
+
+    def test_unlocatable_native_boundary_skips_confirmed_sent_markers(self):
+        self.bind()
+        for n in range(1, 4):
+            self.append_rows(*self.native_rows(
+                f"marker-recovery-{n}", f"Marker update {n}.", "commentary",
+                f"2026-01-02T00:{n:02d}:00Z"))
+        updates = codex_binding.completed_updates(self.cfg, MAIN, self.pane)
+        notify.mark_content_sent(MAIN, updates[0].identity)
+        self.clock += 1
+        legacy_boundary = "legacy-final-without-native-time"
+        notify.mark_content_sent(MAIN, legacy_boundary)
+        tg.write_state(watch.CONTENT_LAST, {MAIN: legacy_boundary})
+
+        self.poll_updates()
+        self.assertEqual(self.api.texts, ["Marker update 2.", "Marker update 3."])
+        self.assertTrue(notify.content_already_sent(MAIN, updates[0].identity))
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], updates[-1].identity)
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_unlocatable_native_boundary_retries_failed_send_before_later_updates(self):
+        self.bind()
+        for n in range(1, 4):
+            self.append_rows(*self.native_rows(
+                f"retry-recovery-{n}", f"Retryable update {n}.", "commentary",
+                f"2026-01-02T00:{n:02d}:00Z"))
+        updates = codex_binding.completed_updates(self.cfg, MAIN, self.pane)
+        legacy_boundary = "legacy-final-without-native-time"
+        notify.mark_content_sent(MAIN, legacy_boundary)
+        tg.write_state(watch.CONTENT_LAST, {MAIN: legacy_boundary})
+
+        self.api.fail_send = "synthetic transport failure"
+        self.poll_updates()
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], legacy_boundary)
+        self.assertFalse(notify.content_already_sent(MAIN, updates[0].identity))
+
+        self.api.fail_send = ""
+        self.clock += 20
+        self.poll_updates()
+        self.assertEqual(self.api.texts,
+                         [f"Retryable update {n}." for n in range(1, 4)])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], updates[-1].identity)
+        self.poll_updates()
+        self.assertEqual(len(self.api.sent), 3)
+
     def assert_overlapping_completion_delivers_once(self, outer_origin, inner_origin):
         self.begin_updates()
         self.append_rows(*self.native_rows("overlap-final", "One complete final answer.", "final_answer"))

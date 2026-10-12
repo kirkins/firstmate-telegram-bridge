@@ -236,6 +236,9 @@ def _native_message_time(identity: str):
         return None
 
 
+LOST_BOUNDARY_MAX_PER_POLL = 8  # marker-deduped backlog drains oldest first
+
+
 def completed_codex_pass(cfg: dict, pane: dict) -> tuple[bool, bool]:
     """Return (handled, pending) for the paired native completion path."""
     status = pane.get("agent_status", "unknown")
@@ -262,6 +265,7 @@ def completed_codex_pass(cfg: dict, pane: dict) -> tuple[bool, bool]:
         return True, False
     boundary = last if last is not None else delivered
     identities = [update.identity for update in updates]
+    drain_capped = False
     if (boundary and boundary not in identities and _native_message_time(boundary) is None
             and delivered and delivered != boundary):
         boundary = delivered  # a normal final can establish a native boundary after a legacy one
@@ -273,10 +277,17 @@ def completed_codex_pass(cfg: dict, pane: dict) -> tuple[bool, bool]:
         cutoff = _native_message_time(boundary)
         if cutoff is None:
             _note(f"completeboundary:{pane_id}", boundary,
-                  f"content: pane={pane_id} cannot locate native Codex delivery boundary; holding")
-            return True, False
-        updates = [update for update in updates
-                   if (stamp := _native_message_time(update.identity)) is not None and stamp > cutoff]
+                  f"content: pane={pane_id} cannot locate native Codex delivery boundary; "
+                  f"deduping by sent-marker (oldest {LOST_BOUNDARY_MAX_PER_POLL} per poll)")
+            unsent = [update for update in updates
+                      if not notify.content_already_sent(pane_id, update.identity)]
+            drain_capped = len(unsent) > LOST_BOUNDARY_MAX_PER_POLL
+            if drain_capped:
+                final_identity = unsent[LOST_BOUNDARY_MAX_PER_POLL - 1].identity
+                updates = updates[:identities.index(final_identity) + 1]
+        else:
+            updates = [update for update in updates
+                       if (stamp := _native_message_time(update.identity)) is not None and stamp > cutoff]
     for update in updates:
         if not notify.content_already_sent(pane_id, update.identity):
             if not notify.deliver(cfg, pane_id, "done", "working",
@@ -287,10 +298,7 @@ def completed_codex_pass(cfg: dict, pane: dict) -> tuple[bool, bool]:
                       f"content: pane={pane_id} completed Codex message not delivered; retrying")
                 return True, True  # retain ordering and the undelivered boundary on failure
         _set_content_last(pane_id, update.identity)
-    return True, False
-
-
-MIDRUN_MAX_PER_POLL = 8  # boundary lost: per-poll catch-up cap, drained oldest first
+    return True, drain_capped
 
 
 def _after_boundary(messages: list[tuple[str, str]], boundary: str,
@@ -309,7 +317,7 @@ def _after_boundary(messages: list[tuple[str, str]], boundary: str,
         return kept
     _note(f"boundary:{pane_id}", boundary,
           f"content: pane={pane_id} cannot locate delivery boundary {boundary[:24]} in transcript; "
-          f"deduping by sent-marker (oldest {MIDRUN_MAX_PER_POLL} per poll)")
+          f"deduping by sent-marker (oldest {LOST_BOUNDARY_MAX_PER_POLL} per poll)")
     return None
 
 
@@ -364,8 +372,8 @@ def midrun_pass(cfg: dict, pane: dict, prime: bool = False) -> bool:
     drain_capped = False
     if after is None:
         unsent = [m for m in messages if not notify.content_already_sent(pane_id, m[0])]
-        drain_capped = len(unsent) > MIDRUN_MAX_PER_POLL
-        after = unsent[:MIDRUN_MAX_PER_POLL]
+        drain_capped = len(unsent) > LOST_BOUNDARY_MAX_PER_POLL
+        after = unsent[:LOST_BOUNDARY_MAX_PER_POLL]
     pending = [m for m in after if not notify.content_already_sent(pane_id, m[0])]
     if not pending:
         if messages[-1][0] != boundary:

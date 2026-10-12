@@ -252,7 +252,7 @@ class TestOrderingAndDedup(MidrunCase):
                       session={"kind": "path",
                                "value": transcript(new, "new session", backlog)})
         self.run_once(entry, {MAIN: "working"}, self.config())   # working->idle
-        self.assertEqual(self.sent_count(), watch.MIDRUN_MAX_PER_POLL)
+        self.assertEqual(self.sent_count(), watch.LOST_BOUNDARY_MAX_PER_POLL)
         first = " || ".join(self.sent_texts())
         self.assertIn("message number 1 of the backlog", first)  # oldest first
         self.assertNotIn("message number 12 of the backlog", first)  # tail held back
@@ -314,7 +314,7 @@ class TestOrderingAndDedup(MidrunCase):
                       session={"kind": "path",
                                "value": transcript(new, "new session", backlog)})
         self.run_once(entry, {MAIN: "idle"}, self.config())
-        capped = watch.MIDRUN_MAX_PER_POLL
+        capped = watch.LOST_BOUNDARY_MAX_PER_POLL
         self.assertEqual(self.sent_count(), capped)
         first = " || ".join(self.sent_texts())
         self.assertIn("message number 1 of the backlog", first)  # oldest first

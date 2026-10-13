@@ -108,8 +108,10 @@ fetched and no messages are sent.
 
 Run the appropriate command from the current primary conversation after `/new`,
 `/resume`, a Codex process replacement, or a main-pane replacement. Reads fail
-closed on a changed PID/start time, a missing or duplicate exact rollout, or any
-change to another same-cwd rollout since binding. This last check detects
+closed on a changed PID/start time, a duplicate exact rollout, or any change to
+another same-cwd rollout since binding. A missing or unreadable exact rollout
+also stops delivery, but retries the same source without requiring registration.
+The competing-rollout check detects
 in-process replacements and conservatively refuses active same-cwd workers too;
 it never retargets to those conversations. A rollout that cannot be read at all
 (e.g. a zero-byte file left by a crashed session) is fingerprinted as an opaque
@@ -129,14 +131,18 @@ with the owner-registration instructions above. `source_unavailable` reports
 unavailable explicit reference never falls back to the old binding or a sibling
 rollout.
 
-The watcher sends a Telegram recovery notice for a handoff-required condition,
-once per configured home, pane/process lifetime, and refusal reason until
-recovery. Successful notices are remembered in `bridge_health.json` across
-poller restarts; failed sends retry. Diagnostic retention is bounded (seven days,
-32 notice identities per scope, 500 scopes), independently of reply cursors and
-delivery markers. A valid source or a switch to another current harness clears
-that home's recovery state. Transient agent-list/process-info outages do not
-request a new registration.
+The watcher sends a Telegram recovery notice for a handoff-required condition
+once its pane/process lifetime is verified; an unavailable lifetime defers the
+notice until lookup recovers. An ambiguous main route produces a Codex recovery
+notice only when at least one home candidate is Codex, and its identity includes
+all candidate pane/process lifetimes. Notices are deduplicated by configured
+home, pane/process lifetime, and refusal reason. Successful notices are remembered
+in `bridge_health.json` across poller restarts; failed sends retry. Notice history
+expires after seven days and is capped at 32 identities per scope; health state
+is capped at 500 scopes, independently of reply cursors and delivery markers.
+A valid source or a switch to another resolved current harness clears that
+home's recovery state. Transient agent-list/process-info outages preserve notice
+history and do not request a new registration.
 
 The current primary owner must still register its verified session after a
 replacement when Herdr omits the reference. The bridge does not discover or

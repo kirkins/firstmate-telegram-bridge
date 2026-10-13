@@ -235,20 +235,21 @@ def poll_once(cfg: dict, prime: bool = False) -> None:
             candidates = [p for p in result.get("agents", [])
                           if p.get("cwd") == firstmate.main_cwd(cfg)
                           and p.get("pane_id")]
-            lifetime = None
-            if route.reason == "conversation_ambiguous" and candidates:
-                try:
-                    observed = []
-                    for candidate in sorted(candidates, key=lambda p: p["pane_id"]):
-                        processes = codex_binding._foreground(candidate["pane_id"], agent=None)
-                        if not processes:
-                            observed.append((candidate["pane_id"],))
-                        for pid in sorted(processes):
-                            observed.append((candidate["pane_id"], pid, codex_binding._process(pid)[1]))
-                    lifetime = tuple(observed)
-                except (codex_binding.BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
-                    pass
-            source_health(cfg, {}, codex_binding.Resolution(reason=route.reason, lifetime=lifetime))
+            if any(p.get("agent") == "codex" for p in candidates):
+                lifetime = None
+                if route.reason == "conversation_ambiguous":
+                    try:
+                        observed = []
+                        for candidate in sorted(candidates, key=lambda p: p["pane_id"]):
+                            processes = codex_binding._foreground(candidate["pane_id"], agent=None)
+                            if not processes:
+                                observed.append((candidate["pane_id"],))
+                            for pid in sorted(processes):
+                                observed.append((candidate["pane_id"], pid, codex_binding._process(pid)[1]))
+                        lifetime = tuple(observed)
+                    except (codex_binding.BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+                        pass
+                source_health(cfg, {}, codex_binding.Resolution(reason=route.reason, lifetime=lifetime))
         for pane in result.get("agents", []):
             if pane.get("pane_id") == main:
                 if pane.get("agent") == "codex":

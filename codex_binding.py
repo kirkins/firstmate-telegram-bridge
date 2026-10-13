@@ -185,12 +185,14 @@ def _changed(current: tuple[dict, dict], snapshot: tuple) -> str:
     return "; ".join(changed[:3])
 
 
-def _main(cfg: dict, pane_id: str, info: dict) -> str:
+def _main(cfg: dict, pane_id: str, info: dict,
+          route: firstmate.MainPaneResult | None = None) -> str:
     cwd = firstmate.main_cwd(cfg)
     if (not firstmate.enabled(cfg) or info.get("agent") != "codex" or info.get("cwd") != cwd
             or (info.get("foreground_cwd") or cwd) != cwd):
         raise BindingError("pane is not the primary Codex pane", "primary_replaced")
-    route = firstmate.main_pane_result(cfg)
+    if route is None:
+        route = firstmate.main_pane_result(cfg)
     if not route.target:
         raise BindingError("primary source unavailable", route.reason)
     if pane_id != route.target["pane"]:
@@ -202,7 +204,16 @@ def binding_result(cfg: dict, pane_id: str, info: dict) -> Resolution:
     """Classify a read without changing the binding or choosing a replacement."""
     lifetime = None
     try:
-        cwd = _main(cfg, pane_id, info)
+        route = firstmate.main_pane_result(cfg)
+        try:
+            cwd = _main(cfg, pane_id, info, route)
+        except BindingError:
+            if route.target and route.target["pane"] == pane_id:
+                try:
+                    lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(_foreground(pane_id)))
+                except (BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+                    pass
+            raise
         foreground = _foreground(pane_id)
         lifetime = tuple((pid, _process(pid)[1]) for pid in sorted(foreground))
         binding = tg.read_state(BINDING, {})

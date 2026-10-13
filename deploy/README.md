@@ -108,8 +108,10 @@ fetched and no messages are sent.
 
 Run the appropriate command from the current primary conversation after `/new`,
 `/resume`, a Codex process replacement, or a main-pane replacement. Reads fail
-closed on a changed PID/start time, a missing or duplicate exact rollout, or any
-change to another same-cwd rollout since binding. This last check detects
+closed on a changed PID/start time, a duplicate exact rollout, or any change to
+another same-cwd rollout since binding. A missing or unreadable exact rollout
+also stops delivery, but retries the same source without requiring registration.
+The competing-rollout check detects
 in-process replacements and conservatively refuses active same-cwd workers too;
 it never retargets to those conversations. A rollout that cannot be read at all
 (e.g. a zero-byte file left by a crashed session) is fingerprinted as an opaque
@@ -119,12 +121,41 @@ after the intended primary session is active. For the managed path, obtain its
 new owner-verified reference each time; an old UUID cannot authorize a new native
 thread. The snapshot is metadata, not a portable installation file.
 
-An ordinary shell can validate the existing binding without changing it by
-adding `--check` to the command. Explicit Herdr session references bypass this
-fallback. The watcher reloads the binding on each read, so rebinding needs no
-service restart. If a Codex completion has no displayable reply, firstmate mode
-logs it rather than sending a title banner; an unresolved binding needs repair
-before actual replies can arrive.
+An ordinary shell can check reply health without changing the binding by
+adding `--check` to the command. It uses a current explicit Herdr reference when
+present, otherwise the existing binding, without fetching credentials or sending
+a message. It reports `handoff_required` for `missing_binding`,
+`primary_replaced`, `process_lifetime_changed`, or `conversation_ambiguous`,
+with the owner-registration instructions above. `source_unavailable` reports
+`retrying`: restore access to the same source and let polling retry it. An
+unavailable explicit reference never falls back to the old binding or a sibling
+rollout.
+
+The watcher sends a Telegram recovery notice for a handoff-required condition
+once its pane/process lifetime is verified; an unavailable lifetime defers the
+notice until lookup recovers. An ambiguous main route produces a Codex recovery
+notice only when at least one home candidate is Codex, and its identity includes
+all candidate pane/process lifetimes. Notices are deduplicated by configured
+home, pane/process lifetime, and refusal reason. Successful notices are remembered
+in `bridge_health.json` across poller restarts; failed sends retry. Notice history
+expires after seven days and is capped at 32 identities per scope; health state
+is capped at 500 scopes, independently of reply cursors and delivery markers.
+A valid source or a switch to another resolved current harness clears that
+home's recovery state. Transient agent-list/process-info outages preserve notice
+history and do not request a new registration.
+
+The current primary owner must still register its verified session after a
+replacement when Herdr omits the reference. The bridge does not discover or
+manufacture a replacement identity from newer files, cwd, pane index, title,
+shared PID, or an old hook UUID. A self-consistent UUID is insufficient authority
+for asynchronous handoff; trusted selected-conversation/generation production
+remains a separate requirement. The helper is an explicit owner workflow.
+
+Normal polling reloads the binding, clears health/notice state when the source
+becomes valid, and resumes ordered delivery without a service restart or cursor
+reset. If a Codex completion has no displayable reply, firstmate mode logs it
+rather than sending a title banner. Fresh-install priming and bounded transcript
+history still apply; recovery does not promise unlimited historical replay.
 
 If a native delivery cursor is absent from the bounded rollout tail and has no
 native timestamp, the watcher checks the shared content-sent marker and drains

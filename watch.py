@@ -86,6 +86,8 @@ message newer than the last delivered one is delivered, not recorded as known
 
 import threading
 import time
+import hashlib
+import json
 from datetime import datetime
 
 import firstmate
@@ -103,6 +105,61 @@ MIN_POLL_SECONDS = 5
 _NOTES: dict[str, str] = {}
 
 CONTENT_LAST = "content_last.json"   # pane -> identity of its last final message
+BRIDGE_HEALTH = "bridge_health.json"  # diagnostic state only; never a delivery cursor
+
+
+def source_health(cfg: dict, pane: dict, result: codex_binding.Resolution) -> None:
+    """One recovery notice per home/pane/lifetime/reason until recovery.
+
+    Persist notice success under the existing state-file lock so another poller
+    or a restart cannot repeat it. Failed notices retry without stamping any
+    transcript delivery marker. This uses the normal text-notice send path.
+    """
+    pane_id = pane.get("pane_id", "")
+    home = hashlib.sha256(firstmate.main_cwd(cfg).encode()).hexdigest()
+    scope = hashlib.sha256(json.dumps([home, pane_id]).encode()).hexdigest()
+    codex_binding._diagnostic(cfg, pane_id, result)
+    with tg.state_file_lock(BRIDGE_HEALTH):
+        health = tg.read_state(BRIDGE_HEALTH, {})
+        if result.path:
+            recovered = {k: v for k, v in health.items() if v.get("home") != home}
+            if recovered != health:
+                tg.write_state(BRIDGE_HEALTH, recovered)
+            return
+        entry = health.get(scope, {})
+        notices = entry.get("notices", {})
+        now = time.time()
+        notices = {k: t for k, t in notices.items() if now - t < notify.CONTENT_SENT_SECS}
+        identity = hashlib.sha256(repr((result.lifetime, result.reason)).encode()).hexdigest()
+        if (result.state == "handoff_required" and result.lifetime is not None
+                and identity not in notices):
+            text = ("⚠️ Manager replies are disconnected: " + {
+                "missing_binding": "the current session has not been registered.",
+                "primary_replaced": "the manager was replaced.",
+                "process_lifetime_changed": "the manager process changed.",
+                "conversation_ambiguous": "the current conversation cannot be verified.",
+            }.get(result.reason, "the current session cannot be verified.")
+                    + " Your messages can still reach the manager when its main pane is available. "
+                    "Ask the current manager to register its verified session with the bridge's "
+                    "owner-registration workflow. Replies will resume automatically; "
+                    "no bridge restart is needed. Recovery guide: "
+                    "https://github.com/kirkins/firstmate-telegram-bridge/blob/main/deploy/README.md"
+                    "#codex-main-session-binding")
+            target = firstmate.main_target(cfg) if pane_id else None
+            # A replaced/ambiguous route may not have a promptable target. A
+            # bridge-health notice contains no transcript or target identity.
+            if notify.send_message(cfg, text, target=target):
+                notices[identity] = now
+        if len(notices) > 32:
+            notices = dict(sorted(notices.items(), key=lambda item: item[1])[-32:])
+        current = {"home": home, "state": result.state, "reason": result.reason,
+                   "lifetime": ([list(item) for item in result.lifetime]
+                                if result.lifetime is not None else None),
+                   "notices": notices, "updated": now}
+        health[scope] = current
+        if len(health) > 500:
+            health = dict(sorted(health.items(), key=lambda item: item[1]["updated"])[-500:])
+        tg.write_state(BRIDGE_HEALTH, health)
 
 
 def _note(key: str, value: str, line: str) -> None:
@@ -164,11 +221,43 @@ def poll_once(cfg: dict, prime: bool = False) -> None:
     timeout — see tg.run_bounded for why that is not optional."""
     result, err = tg.herdr_json("agent", "list", timeout=10)
     if err:
-        tg.log(f"watch: agent list failed: {err}")
+        _note(f"agentlist:{tg.STATE_DIR}", "unavailable", "watch: agent list unavailable; retrying next poll")
+        if firstmate.enabled(cfg):
+            source_health(cfg, {}, codex_binding.Resolution(reason="source_unavailable"))
         return
+    _NOTES.pop(f"agentlist:{tg.STATE_DIR}", None)
     content = content_delivery(cfg)
     fm = firstmate.enabled(cfg)
-    main = firstmate.main_pane_id(cfg) if content and fm else None
+    route = firstmate.main_pane_result(cfg) if fm else None
+    main = (route.target["pane"] if route.target else "") if fm else None
+    if fm:
+        if not main:
+            candidates = [p for p in result.get("agents", [])
+                          if p.get("cwd") == firstmate.main_cwd(cfg)
+                          and p.get("pane_id")]
+            if any(p.get("agent") == "codex" for p in candidates):
+                lifetime = None
+                if route.reason == "conversation_ambiguous":
+                    try:
+                        observed = []
+                        for candidate in sorted(candidates, key=lambda p: p["pane_id"]):
+                            processes = codex_binding._foreground(candidate["pane_id"], agent=None)
+                            if not processes:
+                                observed.append((candidate["pane_id"],))
+                            for pid in sorted(processes):
+                                observed.append((candidate["pane_id"], pid, codex_binding._process(pid)[1]))
+                        lifetime = tuple(observed)
+                    except (codex_binding.BindingError, OSError, ValueError, IndexError, KeyError, TypeError):
+                        pass
+                source_health(cfg, {}, codex_binding.Resolution(reason=route.reason, lifetime=lifetime))
+        for pane in result.get("agents", []):
+            if pane.get("pane_id") == main:
+                if pane.get("agent") == "codex":
+                    source_health(cfg, pane, codex_binding.source_result(
+                        cfg, main, pane, pane.get("agent_session") or {}, notify.transcript_cwd(pane, "codex")))
+                else:
+                    source_health(cfg, pane, codex_binding.Resolution(path="other-harness"))
+                break
     pending_completions = set()
     if content and fm:
         # Deliver sealed main-pane messages in transcript order BEFORE a status

@@ -27,6 +27,7 @@ See README.md "Firstmate posture" for the operator's view of all of this.
 """
 
 import os
+from typing import NamedTuple
 
 import tg
 
@@ -180,42 +181,53 @@ def _target_from(agent: dict) -> dict:
             "folder": tg.short_home(agent.get("cwd") or agent.get("foreground_cwd") or "")}
 
 
-def main_pane(cfg: dict) -> dict | None:
-    """Resolve the firstmate main pane -> {"pane","agent","folder"} or None.
+class MainPaneResult(NamedTuple):
+    target: dict | None = None
+    reason: str = "source_unavailable"
+
+
+def main_pane_result(cfg: dict) -> MainPaneResult:
+    """Resolve the firstmate main target and its lookup failure reason.
 
     1. [firstmate].main_pane pin, revalidated live via `herdr agent get`;
     2. else exact cwd == main_cwd over `herdr agent list`. Several matches (a worker
        that cd'd into the firstmate home) resolve to the one candidate no
-       state/*.meta claims; still ambiguous -> None.
-    None means fail closed: callers refuse to route replies anywhere.
+       state/*.meta claims; still ambiguous -> no target.
+    An absent target means fail closed, with the reason from this lookup.
     """
     if not enabled(cfg):
-        return None
+        return MainPaneResult()
     pin = str(conf(cfg).get("main_pane", "")).strip()
     if pin:
         result, err = tg.herdr_json("agent", "get", pin, timeout=10)
         agent = result.get("agent", {})
         if not err and agent.get("cwd"):
-            return _target_from(agent)
+            return MainPaneResult(_target_from(agent), "")
         tg.log(f"firstmate: pinned main_pane {pin} not live ({err or 'no cwd'}); scanning by cwd")
     result, err = tg.herdr_json("agent", "list", timeout=10)
     if err:
         tg.log(f"firstmate: agent list failed: {err}")
-        return None
+        return MainPaneResult()
     want = main_cwd(cfg)
     cands = [a for a in result.get("agents", [])
              if a.get("pane_id") and a.get("cwd") == want]
     if len(cands) == 1:
-        return _target_from(cands[0])
+        return MainPaneResult(_target_from(cands[0]), "")
     if not cands:
         tg.log(f"firstmate: no pane has cwd == {want}")
-        return None
+        return MainPaneResult()
     unclaimed = [a for a in cands if not claims_pane(cfg, a["pane_id"])]
     if len(unclaimed) == 1:
-        return _target_from(unclaimed[0])
+        return MainPaneResult(_target_from(unclaimed[0]), "")
+    if pin and any(a.get("pane_id") == pin for a in result.get("agents", [])):
+        return MainPaneResult()
     tg.log(f"firstmate: {len(cands)} panes match main_cwd={want} and none is "
            f"unambiguously the main pane — failing closed")
-    return None
+    return MainPaneResult(reason="conversation_ambiguous")
+
+
+def main_pane(cfg: dict) -> dict | None:
+    return main_pane_result(cfg).target
 
 
 def main_pane_id(cfg: dict) -> str:

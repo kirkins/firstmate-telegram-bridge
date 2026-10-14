@@ -63,6 +63,13 @@ def _transcript(session_id: str, cwd: str) -> tuple[str, tuple[int, int]]:
     with open(path, "rb") as f:
         stat = os.fstat(f.fileno())
         lines = f.read(600_000).splitlines(keepends=True)
+        if stat.st_size > 600_000:
+            offset = max(0, stat.st_size - 2_000_000)
+            f.seek(max(0, offset - 1))
+            tail = f.read(2_000_001 if offset else 2_000_000)
+            if offset:
+                tail = tail.partition(b"\n")[2]
+            lines.extend(tail.splitlines(keepends=True))
     for line in lines:
         if not line.endswith(b"\n"):
             continue  # bounded or still-being-written record

@@ -82,11 +82,11 @@ class TestClaudeSession(unittest.TestCase):
     def registry(self):
         (self.sessions / "200.json").write_text(json.dumps(self.native))
 
-    def rollout(self, sid, messages, cwd=None, folder="owner"):
+    def rollout(self, sid, messages, cwd=None, folder="owner", request="Synthetic request."):
         path = self.projects / folder / (sid + ".jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = [{"type": "user", "sessionId": sid, "cwd": cwd or self.home,
-                 "message": {"role": "user", "content": "Synthetic request."}}]
+                 "message": {"role": "user", "content": request}}]
         for mid, text in messages:
             rows.append({"type": "assistant", "sessionId": sid, "cwd": cwd or self.home,
                          "isSidechain": False, "timestamp": "2026-10-14T03:19:22.920Z",
@@ -129,6 +129,100 @@ class TestClaudeSession(unittest.TestCase):
             notify.main()
             notify.main()
         self.assertEqual(self.api.texts, [ANSWER])
+
+    def test_notification_oversized_opening_record_delivers_once(self):
+        for size in (700_000, 4_100_000):
+            with self.subTest(size=size):
+                reset_state()
+                self.api.sent.clear()
+                self.rollout(CURRENT, [("final", ANSWER)], request="x" * size)
+                self.assertTrue(self.deliver())
+                self.assertFalse(self.deliver())
+                self.assertEqual(self.api.texts, [ANSWER])
+                identity, text = notify.reply_identity("claude", {}, self.home, MAIN,
+                                                     cfg=self.cfg, info=self.pane)
+                self.assertEqual(text, ANSWER)
+                self.assertTrue(notify.content_already_sent(MAIN, identity))
+
+    def test_watcher_oversized_opening_record_orders_and_dedupes_replies(self):
+        intermediate = "A complete synthetic intermediate reply."
+        for size in (700_000, 4_100_000):
+            with self.subTest(size=size):
+                reset_state()
+                self.api.sent.clear()
+                self.pane["agent_status"] = "working"
+                self.rollout(CURRENT, [("old", "A prior synthetic reply.")], request="x" * size)
+                watch.poll_once(self.cfg, prime=True)
+                self.assertEqual(self.api.sent, [])
+                self.assertTrue(watch._content_last(MAIN).startswith("old@"))
+                with self.path.open("a") as f:
+                    for mid, text in (("interior", intermediate), ("final", ANSWER)):
+                        f.write(json.dumps({"type": "assistant", "sessionId": CURRENT,
+                                            "cwd": self.home, "timestamp": "2026-10-14T03:19:22.920Z",
+                                            "message": {"id": mid, "role": "assistant",
+                                                        "content": [{"type": "text", "text": text}]}}) + "\n")
+                watch.poll_once(self.cfg)
+                self.assertEqual(self.api.texts, [intermediate])
+                self.pane["agent_status"] = "idle"
+                watch.poll_once(self.cfg)
+                watch.poll_once(self.cfg)
+                self.assertFalse(self.deliver())
+                self.assertEqual(self.api.texts, [intermediate, ANSWER])
+
+    def test_oversized_transcript_rejects_mismatched_native_metadata(self):
+        for size in (700_000, 4_100_000):
+            for key, value in (("sessionId", OTHER), ("cwd", "/other")):
+                for location in ("head", "tail"):
+                    with self.subTest(size=size, key=key, location=location):
+                        reset_state()
+                        self.api.sent.clear()
+                        self.rollout(CURRENT, [("final", ANSWER)], request="x" * size)
+                        wrong = {"type": "user", "sessionId": CURRENT, "cwd": self.home,
+                                 "message": {"role": "user", "content": "A conflicting record."},
+                                 key: value}
+                        record = json.dumps(wrong) + "\n"
+                        if location == "head":
+                            self.path.write_text(record + self.path.read_text())
+                        else:
+                            with self.path.open("a") as f:
+                                f.write(record)
+                        self.assertIsNone(self.source())
+                        self.deliver()
+                        watch.midrun_pass(self.cfg, self.pane)
+                        self.assert_no_body()
+
+    def test_oversized_transcript_incomplete_tail_is_not_identity_evidence(self):
+        self.rollout(CURRENT, [], request="x" * 4_100_000)
+        row = {"type": "assistant", "sessionId": CURRENT, "cwd": self.home,
+               "message": {"id": "final", "role": "assistant", "content": ANSWER}}
+        with self.path.open("a") as f:
+            f.write(json.dumps(row)[:100])
+        self.assertIsNone(self.source())
+        self.deliver()
+        watch.midrun_pass(self.cfg, self.pane)
+        self.assert_no_body()
+
+    def test_oversized_transcript_validation_keeps_reads_bounded(self):
+        self.rollout(CURRENT, [("final", ANSWER)], request="x" * 4_100_000)
+        reads = []
+        def bounded_open(path, *args, **kwargs):
+            f = open(path, *args, **kwargs)
+            if str(path) == str(self.path):
+                read = f.read
+                total = 0
+                def bounded_read(size=-1):
+                    nonlocal total
+                    self.assertGreater(size, 0)
+                    data = read(size)
+                    total += len(data)
+                    reads.append(len(data))
+                    self.assertLessEqual(total, 2_600_001)
+                    return data
+                f.read = bounded_read
+            return f
+        with patch("claude_session.open", side_effect=bounded_open):
+            self.assertIsNotNone(self.source())
+        self.assertTrue(reads)
 
     def test_watcher_entry_point_final_once_and_status_dedupes(self):
         with patch.object(watch, "content_pass", side_effect=AssertionError("Claude uses midrun")):

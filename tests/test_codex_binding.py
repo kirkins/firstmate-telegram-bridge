@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import _env  # noqa: F401  (env must be set before tg/notify/watch imports)
 import bot
+import claude_session
 import codex_binding
 import firstmate
 import notify
@@ -18,6 +19,7 @@ import tg
 import watch
 from _env import (CHAT, MAIN, WORKER, FakeApi, FakeHerdr, agent, make_home,
                   reset_state, transcript, write_config)
+from test_claude_session import ProcessHerdr as ClaudeHerdr
 
 CURRENT = "11111111-1111-1111-1111-111111111111"
 OTHER = "22222222-2222-2222-2222-222222222222"
@@ -1606,6 +1608,65 @@ class TestCodexBinding(unittest.TestCase):
         with self.assertRaises(codex_binding.BindingError):
             self.bind_managed()
         self.assertEqual(tg.read_state(codex_binding.BINDING, {}), {})
+
+    def test_preserved_mise_binding_and_backlog_coexist_with_claude_fallback(self):
+        self.mise_chain()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": CURRENT}), \
+                patch.object(codex_binding.os, "getpid", return_value=300):
+            with patch.object(tg, "write_state") as write:
+                candidate = codex_binding.prepare_binding(self.cfg, MAIN, self.pane, CURRENT)
+                write.assert_not_called()
+            self.assertEqual(self.bind_managed(), candidate)
+        binding = tg.read_state(codex_binding.BINDING, {})
+        self.pane["agent_status"] = "working"
+        for n in range(1, 11):
+            self.append_rows(*self.native_rows(
+                f"coexist-{n}", f"Codex update {n}.", "commentary",
+                f"2026-01-02T00:{n:02d}:00Z"))
+        updates = codex_binding.completed_updates(self.cfg, MAIN, self.pane)
+        notify.mark_content_sent(MAIN, updates[2].identity)
+        self.clock += 1
+        notify.mark_content_sent(MAIN, "legacy-boundary")
+        tg.write_state(watch.CONTENT_LAST, {MAIN: "legacy-boundary"})
+        self.poll_updates()
+        expected = [f"Codex update {n}." for n in range(1, 11) if n != 3]
+        self.assertEqual(self.api.texts, expected[:8])
+        self.assertEqual(tg.read_state(watch.CONTENT_LAST, {})[MAIN], updates[8].identity)
+        self.poll_updates()
+        self.assertEqual(self.api.texts, expected)
+
+        # Reuse the same watcher state after the foreground owner becomes Claude.
+        sid = "66666666-6666-4666-8666-666666666666"
+        sessions = self.base / ".claude/sessions"
+        projects = self.base / ".claude/projects"
+        sessions.mkdir(parents=True)
+        self.process(200, 100, "21", name="claude")
+        (self.proc / "200/cwd").symlink_to(self.home)
+        (sessions / "200.json").write_text(json.dumps({
+            "pid": 200, "sessionId": sid, "cwd": self.home, "procStart": "21",
+            "startedAt": 1791946134866, "kind": "interactive", "entrypoint": "cli"}))
+        path = projects / "owner" / (sid + ".jsonl")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "type": "assistant", "sessionId": sid, "cwd": self.home,
+            "timestamp": "2026-10-14T03:19:22.920Z",
+            "message": {"id": "claude-after-codex", "role": "assistant",
+                        "content": [{"type": "text", "text": "Claude fallback reply."}]}}) + "\n")
+        pane = agent(MAIN, self.home, cli="claude", title="Claude Code")
+        herdr = ClaudeHerdr([pane], self.home)
+        self.clock += 20
+        with patch.object(claude_session, "SESSIONS", str(sessions)), \
+                patch.object(claude_session, "PROJECTS", str(projects)), \
+                patch.object(claude_session, "PROC", str(self.proc)), \
+                patch.object(tg, "herdr_json", herdr.json), \
+                patch.object(tg, "herdr_run", herdr.run):
+            self.poll_updates()
+            self.poll_updates()
+            self.assertEqual(self.api.texts, expected + ["Claude fallback reply."])
+            self.assertIsNotNone(claude_session.resolve(self.cfg, MAIN, pane))
+            self.assertEqual(tg.read_state(codex_binding.BINDING, {}), binding)
+            self.assertTrue(all(notify.content_already_sent(MAIN, update.identity)
+                                for update in updates))
 
     def test_managed_without_owner_reference_reproduces_operator_refusal(self):
         self.managed_chain()

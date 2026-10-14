@@ -445,7 +445,7 @@ def midrun_pass(cfg: dict, pane: dict, prime: bool = False) -> bool:
         # (main-allowed), exactly the pre-midrun behavior for this pane
         return bool(content_pass(cfg, pane, prime, main=pane_id))
     if not messages:
-        _note(f"notranscript:{pane_id}", repr((cli, session)),
+        _note(f"notranscript:{pane_id}", repr((cli, session, source)),
               f"content: pane={pane_id} agent={cli or 'agent'} no transcript — status diff only")
         return False
     boundary = _content_last(pane_id)
@@ -546,11 +546,8 @@ def content_pass(cfg: dict, pane: dict, prime: bool = False,
             return pending
     title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
     session = pane.get("agent_session") or {}
-    source = notify.claude_reply_source(cli, session, pane_id, cfg=cfg, info=pane)
-    identity, _text = (("", "") if cli == "claude" and claude_session.missing(session) and source is None
-                      else notify.reply_identity(cli, session, notify.transcript_cwd(pane, cli),
-                                                 pane_id, title, cfg=cfg, info=pane,
-                                                 claude_source=source))
+    identity, _text = notify.reply_identity(cli, session, notify.transcript_cwd(pane, cli),
+                                          pane_id, title, cfg=cfg, info=pane)
     if not identity:
         _note(f"notranscript:{pane_id}", repr((cli, session)),
               f"content: pane={pane_id} agent={cli or 'agent'} no transcript — status diff only")
@@ -581,8 +578,7 @@ def content_pass(cfg: dict, pane: dict, prime: bool = False,
                 tg.log(f"content: pane={pane_id} undelivered on restart {identity[:24]} (pane {status})")
                 if notify.deliver(cfg, pane_id, "done", "idle",
                                   agent=pane.get("display_agent") or cli or "agent",
-                                  cli=cli, title=title, origin="content", content_id=identity,
-                                  claude_source=source):
+                                  cli=cli, title=title, origin="content", content_id=identity):
                     _set_content_last(pane_id, identity)
                 else:
                     # deliver already logged why; say "retrying" once per message
@@ -611,8 +607,7 @@ def content_pass(cfg: dict, pane: dict, prime: bool = False,
     tg.log(f"content: pane={pane_id} new final message {identity[:24]} (pane {status})")
     if notify.deliver(cfg, pane_id, "done", "idle",
                       agent=pane.get("display_agent") or cli or "agent",
-                      cli=cli, title=title, origin="content", content_id=identity,
-                      claude_source=source):
+                      cli=cli, title=title, origin="content", content_id=identity):
         _set_content_last(pane_id, identity)
     else:
         # deliver already logged why (filter, posture, debounce, send failure);

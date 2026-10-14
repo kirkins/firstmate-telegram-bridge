@@ -77,15 +77,7 @@ def _transcript(session_id: str, cwd: str) -> tuple[str, tuple[int, int]]:
     return path, (stat.st_dev, stat.st_ino)
 
 
-def _snapshot(cfg: dict, pane_id: str, info: dict) -> Source:
-    cwd = firstmate.main_cwd(cfg)
-    if (not firstmate.enabled(cfg) or not pane_id
-            or info.get("pane_id") != pane_id or info.get("agent") != "claude"
-            or not missing(info.get("agent_session"))
-            or info.get("cwd") != cwd or info.get("foreground_cwd") != cwd
-            or not os.path.isabs(cwd) or firstmate.claims_pane(cfg, pane_id)
-            or firstmate.main_pane_id(cfg) != pane_id):
-        raise ValueError("not the verified main Claude pane")
+def _owner(pane_id: str, cwd: str) -> tuple[int, str, dict]:
     result, err = tg.herdr_json("pane", "process-info", "--pane", pane_id, timeout=10)
     process_info = result.get("process_info", {})
     foreground = process_info.get("foreground_processes", [])
@@ -108,10 +100,24 @@ def _snapshot(cfg: dict, pane_id: str, info: dict) -> Source:
             or type(proc_start) not in (int, str) or str(proc_start) != ticks
             or type(started_at) is not int or started_at <= 0):
         raise ValueError("native registry identity/lifetime mismatch")
-    path, file_identity = _transcript(session_id, cwd)
-    if _process(pid, cwd) != ticks:
-        raise ValueError("process lifetime changed")
-    return Source(pane_id, cwd, pid, ticks, session_id, started_at, path, file_identity)
+    return pid, ticks, {key: native[key] for key in
+                        ("pid", "cwd", "sessionId", "procStart", "startedAt", "kind", "entrypoint")}
+
+
+def _snapshot(cfg: dict, pane_id: str, info: dict) -> Source:
+    cwd = firstmate.main_cwd(cfg)
+    if (not firstmate.enabled(cfg) or not pane_id
+            or info.get("pane_id") != pane_id or info.get("agent") != "claude"
+            or not missing(info.get("agent_session"))
+            or info.get("cwd") != cwd or info.get("foreground_cwd") != cwd
+            or not os.path.isabs(cwd) or firstmate.claims_pane(cfg, pane_id)
+            or firstmate.main_pane_id(cfg) != pane_id):
+        raise ValueError("not the verified main Claude pane")
+    pid, ticks, native = _owner(pane_id, cwd)
+    path, file_identity = _transcript(native["sessionId"], cwd)
+    if _owner(pane_id, cwd) != (pid, ticks, native) or _process(pid, cwd) != ticks:
+        raise ValueError("foreground Claude ownership changed")
+    return Source(pane_id, cwd, pid, ticks, native["sessionId"], native["startedAt"], path, file_identity)
 
 
 def resolve(cfg: dict | None, pane_id: str, info: dict) -> Source | None:

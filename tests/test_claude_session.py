@@ -131,10 +131,11 @@ class TestClaudeSession(unittest.TestCase):
         self.assertEqual(self.api.texts, [ANSWER])
 
     def test_watcher_entry_point_final_once_and_status_dedupes(self):
-        watch.poll_once(self.cfg, prime=True)
-        self.final()
-        watch.poll_once(self.cfg)
-        watch.poll_once(self.cfg)
+        with patch.object(watch, "content_pass", side_effect=AssertionError("Claude uses midrun")):
+            watch.poll_once(self.cfg, prime=True)
+            self.final()
+            watch.poll_once(self.cfg)
+            watch.poll_once(self.cfg)
         self.assertFalse(self.deliver())
         self.assertEqual(self.api.texts, [ANSWER])
 
@@ -261,6 +262,120 @@ class TestClaudeSession(unittest.TestCase):
         with patch.object(claude_session, "_transcript", side_effect=changed):
             self.assertIsNone(self.source())
 
+    def test_current_rejects_registry_changes_during_transcript_validation(self):
+        source = self.source()
+        self.assertIsNotNone(source)
+        original = self.native.copy()
+        read = claude_session._transcript
+        for key, value in (("pid", 201), ("cwd", "/other"), ("sessionId", OTHER),
+                           ("procStart", "21"), ("procStart", 20),
+                           ("startedAt", original["startedAt"] + 1),
+                           ("kind", "background"), ("entrypoint", "sdk")):
+            with self.subTest(key=key, value=value):
+                self.native = original.copy()
+                self.registry()
+                def changed(*args):
+                    result = read(*args)
+                    self.native[key] = value
+                    self.registry()
+                    return result
+                with patch.object(claude_session, "_transcript", side_effect=changed):
+                    self.assertFalse(claude_session.current(self.cfg, source))
+
+    def test_current_rejects_foreground_changes_during_transcript_validation(self):
+        source = self.source()
+        self.assertIsNotNone(source)
+        good = self.herdr.foreground[0].copy()
+        read = claude_session._transcript
+        for foreground in ([], [good, good], [{**good, "pid": 201}],
+                           [{**good, "name": "pi"}], [{**good, "cwd": "/other"}]):
+            with self.subTest(foreground=foreground):
+                self.herdr.foreground = [good.copy()]
+                def changed(*args):
+                    result = read(*args)
+                    self.herdr.foreground = foreground
+                    return result
+                with patch.object(claude_session, "_transcript", side_effect=changed):
+                    self.assertFalse(claude_session.current(self.cfg, source))
+
+    def test_both_readers_reject_same_pid_session_switch_during_final_validation(self):
+        self.final()
+        source = self.source()
+        self.assertIsNotNone(source)
+        self.rollout(OTHER, [("other", "Another session's reply.")])
+        read = claude_session._transcript
+        for reader, empty in ((notify.reply_identity, ("", "")), (notify.relay_messages, [])):
+            with self.subTest(reader=reader.__name__):
+                self.native["sessionId"] = CURRENT
+                self.registry()
+                def changed(*args):
+                    result = read(*args)
+                    self.native["sessionId"] = OTHER
+                    self.registry()
+                    return result
+                with patch.object(claude_session, "_transcript", side_effect=changed):
+                    self.assertEqual(reader("claude", {}, self.home, MAIN, cfg=self.cfg,
+                                            info=self.pane, claude_source=source), empty)
+
+    def test_notification_same_pid_switch_during_final_check_refuses_send(self):
+        self.final()
+        source = self.source()
+        self.assertIsNotNone(source)
+        self.rollout(OTHER, [("other", "Another session's reply.")])
+        read = claude_session._transcript
+        validating_send = False
+        def changed(*args):
+            result = read(*args)
+            if validating_send:
+                self.native["sessionId"] = OTHER
+                self.registry()
+            return result
+        def format_reply(cfg, pane_id, status, text):
+            nonlocal validating_send
+            validating_send = True
+            return text
+        with patch.object(claude_session, "_transcript", side_effect=changed), \
+                patch.object(notify.firstmate, "calm_excerpt", side_effect=format_reply):
+            self.assertFalse(notify.deliver(self.cfg, MAIN, "idle", "working", cli="claude",
+                                            claude_source=source))
+        self.assertEqual(self.api.sent, [])
+        self.assert_no_body()
+        self.native["sessionId"] = CURRENT
+        self.registry()
+        self.assertTrue(self.deliver())
+        self.assertFalse(self.deliver())
+        self.assertEqual(self.api.texts, [ANSWER])
+
+    def test_watcher_same_pid_switch_during_final_check_retains_boundary(self):
+        watch.midrun_pass(self.cfg, self.pane, prime=True)
+        baseline = watch._content_last(MAIN)
+        self.final()
+        self.rollout(OTHER, [("other", "Another session's reply.")])
+        read = claude_session._transcript
+        validating_send = False
+        def changed(*args):
+            result = read(*args)
+            if validating_send:
+                self.native["sessionId"] = OTHER
+                self.registry()
+            return result
+        def format_reply(cfg, pane_id, status, text):
+            nonlocal validating_send
+            validating_send = True
+            return text
+        with patch.object(claude_session, "_transcript", side_effect=changed), \
+                patch.object(notify.firstmate, "calm_excerpt", side_effect=format_reply):
+            self.assertTrue(watch.midrun_pass(self.cfg, self.pane))
+        self.assertEqual(watch._content_last(MAIN), baseline)
+        self.assertEqual(self.api.sent, [])
+        self.assert_no_body()
+        self.native["sessionId"] = CURRENT
+        self.registry()
+        watch.midrun_pass(self.cfg, self.pane)
+        watch.midrun_pass(self.cfg, self.pane)
+        self.assertFalse(self.deliver())
+        self.assertEqual(self.api.texts, [ANSWER])
+
     def test_ownership_changes_during_read_reject_both_readers(self):
         self.final()
         read = notify.assistant_messages_jsonl
@@ -373,6 +488,36 @@ class TestClaudeSession(unittest.TestCase):
             self.pane["agent"] = "claude"
             watch.midrun_pass(self.cfg, self.pane)
             watch.midrun_pass(self.cfg, self.pane)
+        self.assertEqual(len([c for c in log.call_args_list if "no transcript" in c.args[0]]), 2)
+
+    def test_no_transcript_memo_refreshes_when_native_source_changes(self):
+        self.rollout(CURRENT, [])
+        self.rollout(OTHER, [])
+        with patch.object(tg, "log") as log:
+            watch.midrun_pass(self.cfg, self.pane)
+            watch.midrun_pass(self.cfg, self.pane)
+            self.native["sessionId"] = OTHER
+            self.registry()
+            watch.midrun_pass(self.cfg, self.pane)
+            watch.midrun_pass(self.cfg, self.pane)
+            self.native["startedAt"] += 1
+            self.registry()
+            watch.midrun_pass(self.cfg, self.pane)
+            watch.midrun_pass(self.cfg, self.pane)
+        self.assertEqual(len([c for c in log.call_args_list if "no transcript" in c.args[0]]), 3)
+        self.assertEqual(self.api.sent, [])
+
+    def test_content_pass_memo_refreshes_when_harness_changes(self):
+        cfg = {**self.cfg, "firstmate": {"enabled": False}}
+        with patch.object(tg, "log") as log, \
+                patch.object(notify, "PI_SESSIONS", str(self.base / "no-pi")), \
+                patch.object(claude_session, "resolve", side_effect=AssertionError("discovery disabled")):
+            self.pane["agent"] = "pi"
+            watch.content_pass(cfg, self.pane)
+            watch.content_pass(cfg, self.pane)
+            self.pane["agent"] = "claude"
+            watch.content_pass(cfg, self.pane)
+            watch.content_pass(cfg, self.pane)
         self.assertEqual(len([c for c in log.call_args_list if "no transcript" in c.args[0]]), 2)
 
 

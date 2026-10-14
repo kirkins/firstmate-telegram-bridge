@@ -24,6 +24,7 @@ from datetime import datetime
 
 import firstmate
 import codex_binding
+import claude_session
 import tg
 import tts
 
@@ -531,9 +532,18 @@ def resolve_session(agent: str, session: dict, cwd: str, title: str) -> str:
     return value
 
 
+def claude_reply_source(agent: str, session: dict, pane_id: str, *,
+                       cfg: dict | None = None, info: dict | None = None) -> claude_session.Source | None:
+    """Missing Claude references alone use the read-only foreground registry."""
+    if agent != "claude" or not claude_session.missing(session) or not firstmate.enabled(cfg):
+        return None
+    return claude_session.resolve(cfg, pane_id, info if info is not None else agent_info(pane_id))
+
+
 def reply_identity(agent: str, session: dict, cwd: str,
                    pane_id: str = "", title: str = "", *,
-                   cfg: dict | None = None, info: dict | None = None) -> tuple[str, str]:
+                   cfg: dict | None = None, info: dict | None = None,
+                   claude_source: claude_session.Source | None = None) -> tuple[str, str]:
     """(message identity, text) of the pane's last assistant message, via the
     same per-CLI transcript resolution the snippet uses. The identity anchors
     content-anchored delivery and the shared sent-marker; ("", "") when no
@@ -550,6 +560,12 @@ def reply_identity(agent: str, session: dict, cwd: str,
         return last_reply_hermes(session.get("value", ""))
     if agent == "opencode":
         return last_reply_opencode(resolve_session(agent, session, cwd, title))
+    if agent == "claude" and claude_session.missing(session):
+        source = claude_source or claude_reply_source(agent, session, pane_id, cfg=cfg, info=info)
+        if not source:
+            return "", ""
+        reply = last_assistant_jsonl(source.path)
+        return reply if claude_session.current(cfg, source) else ("", "")
     sf = session_file(agent, session, cwd)
     return last_assistant_jsonl(sf) if sf else ("", "")
 
@@ -563,17 +579,24 @@ SINGLE_SLOT_AGENTS = ("grok", "kimi", "hermes", "opencode", "codex")
 
 def relay_messages(agent: str, session: dict, cwd: str,
                    pane_id: str = "", title: str = "", *,
-                   cfg: dict | None = None, info: dict | None = None) -> list[tuple[str, str]] | None:
+                   cfg: dict | None = None, info: dict | None = None,
+                   claude_source: claude_session.Source | None = None) -> list[tuple[str, str]] | None:
     """Every sealed assistant text message the pane's transcript resolves, in
     transcript order — the enumerated sibling of reply_identity. None means the
     CLI has no list reader here (grok/kimi/hermes/opencode keep the single-slot
     last-message behavior; codex delivers through the native completion pass,
-    never a raw rollout enumeration); [] means a resolved transcript with no
-    assistant text yet. Only the session jsonl formats enumerate (claude /
-    pi / generic)."""
+    never a raw rollout enumeration); [] means no eligible assistant text,
+    including an unavailable or changed source. Only the session jsonl formats
+    enumerate (claude / pi / generic)."""
     session = session or {}
     if agent in SINGLE_SLOT_AGENTS:
         return None
+    if agent == "claude" and claude_session.missing(session):
+        source = claude_source or claude_reply_source(agent, session, pane_id, cfg=cfg, info=info)
+        if not source:
+            return []
+        messages = assistant_messages_jsonl(source.path)
+        return messages if claude_session.current(cfg, source) else []
     sf = session_file(agent, session, cwd)
     return assistant_messages_jsonl(sf) if sf else []
 
@@ -858,7 +881,8 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
             agent: str = "agent", cli: str = "", title: str = "",
             origin: str = "status", content_id: str = "",
             completed_update: codex_binding.CompletedUpdate | None = None,
-            content_text: str = "", intermediate: bool = False) -> bool:
+            content_text: str = "", intermediate: bool = False,
+            claude_source: claude_session.Source | None = None) -> bool:
     """The one send path for pane and sealed-message notifications, shared by the event
     hook (main below), the poll-based status diff (watch.py), the content
     pass and the mid-run relay (also watch.py): classification, the statuses/agents
@@ -903,6 +927,16 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
         return False
     info = agent_info(pane_id)
     cwd = info.get("cwd") or info.get("foreground_cwd") or ""
+    missing_claude = cli == "claude" and claude_session.missing(info.get("agent_session"))
+    if missing_claude and claude_source is None:
+        claude_source = claude_reply_source(cli, {}, pane_id, cfg=cfg, info=info)
+    if claude_source is not None and (cli != "claude" or claude_source.pane_id != pane_id
+                                     or not claude_session.current(cfg, claude_source)):
+        tg.log(f"skip pane={pane_id}: foreground Claude source changed; retry")
+        return False
+    if missing_claude and (content_id or content_text) and claude_source is None:
+        tg.log(f"skip pane={pane_id}: foreground Claude source unavailable; retry")
+        return False
     if completed:
         if not codex_binding.current_update(cfg, pane_id, info, completed_update):
             tg.log(f"skip pane={pane_id}: completed Codex message/source changed; retry")
@@ -914,10 +948,13 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
         # a caller that already enumerated the transcript hands back its own
         # copy of the message: same identity it dedupes on, same text it read
         identity, reply = content_id, content_text
+    elif missing_claude and claude_source is None:
+        identity, reply = "", ""  # retain status-only behavior when discovery is unavailable
     else:
         identity, reply = reply_identity(cli, info.get("agent_session") or {},
                                          transcript_cwd(info, cli), pane_id,
-                                         info.get("terminal_title_stripped") or "", cfg=cfg, info=info)
+                                         info.get("terminal_title_stripped") or "", cfg=cfg, info=info,
+                                         claude_source=claude_source)
     if (firstmate.enabled(cfg) and cli == "codex"
             and codex_binding.delivery_denied(pane_id, status, identity, reply, content_id)):
         return False
@@ -961,6 +998,9 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
         if (not completed and firstmate.enabled(cfg) and cli == "codex"
                 and codex_binding.changed_during_settle(cfg, pane_id, identity, reply)):
             return False
+        if claude_source is not None and not claude_session.current(cfg, claude_source):
+            tg.log(f"skip pane={pane_id}: foreground Claude source changed during settle; retry")
+            return False
         # Distinct sealed messages need distinct keys, while all Codex completion
         # paths must share a key before a successful send can stamp the marker.
         # Content-keyed deliveries (content/midrun/completed) dedupe on the message
@@ -1001,6 +1041,9 @@ def deliver(cfg: dict, pane_id: str, status: str, prev: str,
             # silent drop is worse); [firstmate] main_header = true restores it. The
             # reply map keys on the sent message, so routing is untouched either way.
             head = "" if reply else head
+        if claude_source is not None and not claude_session.current(cfg, claude_source):
+            tg.log(f"skip pane={pane_id}: foreground Claude source changed before send; retry")
+            return False
         sent = send_notification(cfg, head, reply, target)
         if sent:
             tg.log(f"delivered pane={pane_id} status={status} origin={origin}")

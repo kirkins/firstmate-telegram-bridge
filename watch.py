@@ -93,6 +93,7 @@ from datetime import datetime
 import firstmate
 import notify
 import codex_binding
+import claude_session
 import tg
 
 DEFAULT_POLL_SECONDS = 20
@@ -433,15 +434,18 @@ def midrun_pass(cfg: dict, pane: dict, prime: bool = False) -> bool:
     status = pane.get("agent_status", "unknown")
     title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
     agent_name = pane.get("display_agent") or cli or "agent"
-    messages = notify.relay_messages(cli, pane.get("agent_session") or {},
-                                     notify.transcript_cwd(pane, cli), pane_id,
-                                     title, cfg=cfg, info=pane)
+    session = pane.get("agent_session") or {}
+    source = notify.claude_reply_source(cli, session, pane_id, cfg=cfg, info=pane)
+    messages = ([] if cli == "claude" and claude_session.missing(session) and source is None
+                else notify.relay_messages(cli, session,
+                                           notify.transcript_cwd(pane, cli), pane_id,
+                                           title, cfg=cfg, info=pane, claude_source=source))
     if messages is None:
         # no list reader for this CLI's storage: the single-slot pass stays
         # (main-allowed), exactly the pre-midrun behavior for this pane
         return bool(content_pass(cfg, pane, prime, main=pane_id))
     if not messages:
-        _note(f"notranscript:{pane_id}", "none",
+        _note(f"notranscript:{pane_id}", repr((cli, session, source)),
               f"content: pane={pane_id} agent={cli or 'agent'} no transcript — status diff only")
         return False
     boundary = _content_last(pane_id)
@@ -492,14 +496,14 @@ def midrun_pass(cfg: dict, pane: dict, prime: bool = False) -> bool:
             sent = notify.deliver(cfg, pane_id, "done", "working",
                                   agent=agent_name, cli=cli, title=title,
                                   origin="midrun", content_id=identity,
-                                  content_text=text, intermediate=True)
+                                  content_text=text, intermediate=True, claude_source=source)
         else:
             note = "new final message" if is_tail else "new mid-run message"
             tg.log(f"content: pane={pane_id} {note} {identity[:24]} (pane {status})")
             sent = notify.deliver(cfg, pane_id, "done", "idle",
                                   agent=agent_name, cli=cli, title=title,
                                   origin="content", content_id=identity,
-                                  content_text=text, intermediate=not is_tail)
+                                  content_text=text, intermediate=not is_tail, claude_source=source)
         if not sent:
             # deliver logged why; keep the boundary at this message and defer
             # the status push — ordering survives the retry
@@ -541,11 +545,11 @@ def content_pass(cfg: dict, pane: dict, prime: bool = False,
         if handled:
             return pending
     title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
-    identity, _text = notify.reply_identity(
-        cli, pane.get("agent_session") or {},
-        notify.transcript_cwd(pane, cli), pane_id, title, cfg=cfg, info=pane)
+    session = pane.get("agent_session") or {}
+    identity, _text = notify.reply_identity(cli, session, notify.transcript_cwd(pane, cli),
+                                          pane_id, title, cfg=cfg, info=pane)
     if not identity:
-        _note(f"notranscript:{pane_id}", "none",
+        _note(f"notranscript:{pane_id}", repr((cli, session)),
               f"content: pane={pane_id} agent={cli or 'agent'} no transcript — status diff only")
         return
     if notify.content_already_sent(pane_id, identity):

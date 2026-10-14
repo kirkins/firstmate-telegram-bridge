@@ -585,9 +585,9 @@ def relay_messages(agent: str, session: dict, cwd: str,
     transcript order — the enumerated sibling of reply_identity. None means the
     CLI has no list reader here (grok/kimi/hermes/opencode keep the single-slot
     last-message behavior; codex delivers through the native completion pass,
-    never a raw rollout enumeration); [] means a resolved transcript with no
-    assistant text yet. Only the session jsonl formats enumerate (claude /
-    pi / generic)."""
+    never a raw rollout enumeration); [] means no eligible assistant text,
+    including an unavailable or changed source. Only the session jsonl formats
+    enumerate (claude / pi / generic)."""
     session = session or {}
     if agent in SINGLE_SLOT_AGENTS:
         return None

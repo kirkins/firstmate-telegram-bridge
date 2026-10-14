@@ -119,7 +119,7 @@ Reply text is read from each agent CLI's own session storage:
 
 | Agent | Source |
 |---|---|
-| claude (Claude Code) | `~/.claude/projects/*/<session>.jsonl` |
+| claude (Claude Code) | `~/.claude/projects/*/<session>.jsonl`; see [Firstmate posture](#firstmate-posture) for omitted session references |
 | codex | `~/.codex/sessions/…/rollout-*.jsonl`, using Herdr's explicit reference; firstmate mode can bind an omitted reference to the exact native session (see below) |
 | pi | session path reported by herdr, or the newest session under `~/.pi/agent/sessions/<cwd>` when it reports none — keyed on the pane's `foreground_cwd`, because herdr 0.8.2+ reports a spawned pane's `cwd` as its spawn origin and no session ref for pi, and the origin's directory would resolve somebody else's session |
 | opencode | `~/.local/share/opencode/opencode.db`, session matched by directory + title when herdr reports none |
